@@ -45,6 +45,9 @@ class BotConfig:
     supabase_key_env:      str    # env var holding the anon key
     expected_minutes:      int    # max minutes between runs before "down"
     market_hours_only:     bool   # if True, suppress alerts outside market hours
+    # Schema differences between bots — column names vary
+    runs_started_col:      str = "started_at"   # bot_runs: when did the run start
+    errors_ts_col:         str = "created_at"   # bot_errors: when was error logged
 
 @dataclass
 class BotStatus:
@@ -64,6 +67,7 @@ BOTS = [
         supabase_key_env="CRYPTO_SUPABASE_ANON_KEY",
         expected_minutes=30,    # 15-min cadence + buffer
         market_hours_only=False,
+        # Crypto bot uses default schema: started_at / created_at
     ),
     BotConfig(
         name="Stock",
@@ -71,6 +75,9 @@ BOTS = [
         supabase_key_env="STOCK_SUPABASE_ANON_KEY",
         expected_minutes=90,    # hourly cadence + buffer
         market_hours_only=True,
+        # Stock bot has different column names
+        runs_started_col="start_time",
+        errors_ts_col="timestamp",
     ),
 ]
 
@@ -133,11 +140,11 @@ def check_bot(cfg: BotConfig, now_utc: datetime) -> BotStatus:
     last_run_dt: Optional[datetime] = None
     minutes_since: Optional[float]  = None
     try:
-        runs = sb.table("bot_runs").select("started_at, status").order(
-            "started_at", desc=True
+        runs = sb.table("bot_runs").select(f"{cfg.runs_started_col}, status").order(
+            cfg.runs_started_col, desc=True
         ).limit(1).execute()
         if runs.data and isinstance(runs.data, list) and isinstance(runs.data[0], dict):
-            ts = runs.data[0].get("started_at")
+            ts = runs.data[0].get(cfg.runs_started_col)
             if isinstance(ts, str):
                 last_run_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 minutes_since = (now_utc - last_run_dt).total_seconds() / 60.0
@@ -148,9 +155,9 @@ def check_bot(cfg: BotConfig, now_utc: datetime) -> BotStatus:
     stuck_count = 0
     try:
         stuck_threshold = (now_utc - timedelta(minutes=30)).isoformat()
-        stuck = sb.table("bot_runs").select("id, started_at").eq(
+        stuck = sb.table("bot_runs").select(f"id, {cfg.runs_started_col}").eq(
             "status", "running"
-        ).lt("started_at", stuck_threshold).execute()
+        ).lt(cfg.runs_started_col, stuck_threshold).execute()
         stuck_count = len(stuck.data) if stuck.data else 0
     except Exception as e:
         reasons.append(f"stuck-runs query failed: {e}")
@@ -159,7 +166,7 @@ def check_bot(cfg: BotConfig, now_utc: datetime) -> BotStatus:
     errors_6h = 0
     try:
         since = (now_utc - timedelta(hours=6)).isoformat()
-        errs = sb.table("bot_errors").select("id").gte("created_at", since).execute()
+        errs = sb.table("bot_errors").select("id").gte(cfg.errors_ts_col, since).execute()
         errors_6h = len(errs.data) if errs.data else 0
     except Exception as e:
         reasons.append(f"bot_errors query failed: {e}")
