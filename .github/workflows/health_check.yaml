@@ -1,0 +1,56 @@
+name: Bot Health Monitor
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 min, 24/7
+  workflow_dispatch: {}
+
+# Prevent overlapping runs
+concurrency:
+  group: bot-health
+  cancel-in-progress: true
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore status state
+        uses: actions/cache/restore@v4
+        with:
+          path: status_state.json
+          key: bot-health-state-${{ github.run_id }}
+          restore-keys: |
+            bot-health-state-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run health check
+        env:
+          # Crypto bot Supabase
+          CRYPTO_SUPABASE_URL:      ${{ secrets.CRYPTO_SUPABASE_URL }}
+          CRYPTO_SUPABASE_ANON_KEY: ${{ secrets.CRYPTO_SUPABASE_ANON_KEY }}
+          # Stock bot Supabase
+          STOCK_SUPABASE_URL:       ${{ secrets.STOCK_SUPABASE_URL }}
+          STOCK_SUPABASE_ANON_KEY:  ${{ secrets.STOCK_SUPABASE_ANON_KEY }}
+          # Discord
+          HEALTH_WEBHOOK_URL:       ${{ secrets.HEALTH_WEBHOOK_URL }}
+        run: python health_check.py
+
+      - name: Save status state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: status_state.json
+          key: bot-health-state-${{ github.run_id }}
