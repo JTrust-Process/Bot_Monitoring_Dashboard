@@ -1,120 +1,86 @@
-# Bot Health Monitor
+# bot-health-monitor
 
-Watches the crypto bot and stock bot. If either stops running, throws errors, or has a stuck cycle, it pings Discord. De-duplicates alerts so a stuck bot doesn't spam your channel.
+Monorepo containing two pieces:
 
-Runs on GitHub Actions every 30 minutes. Free, no infra.
+- **`monitor/`** — Python script + GHA workflow. Runs every 30 min, queries both bots' Supabase projects, pings Discord on issues.
+- **`dashboard/`** — Next.js 15 app deployed to Vercel. Brutalist mission-control UI showing live health status of both bots.
+
+```
+bot-health-monitor/
+├── .github/workflows/
+│   └── health_check.yml      # GHA cron — runs monitor/health_check.py every 30 min
+├── monitor/
+│   ├── health_check.py       # the Python check + Discord pinger
+│   ├── requirements.txt
+│   └── .env.example
+└── dashboard/                # Vercel-deployed Next.js app
+    ├── app/
+    ├── components/
+    ├── package.json
+    ├── .env.local.example
+    └── next.config.js
+```
 
 ---
 
-## What it checks per bot
+## Quickstart
 
-| Check | Threshold |
-|---|---|
-| Last run too old | Crypto > 30 min · Stock > 90 min |
-| Errors in last 6h | ≥ 1 = degraded · ≥ 3 = down |
-| Stuck `running` row | Older than 30 min = down |
+### Monitor (Python + GHA)
 
-Stock bot is only checked during market hours (Mon-Fri 13:30-21:00 UTC). Outside those hours its status shows as `muted` and no alerts fire.
+Runs in this repo automatically. Setup is just secrets:
 
-## Alert behavior
+1. Create a Discord channel for health alerts → add a webhook → copy URL
+2. In this repo: Settings → Secrets and variables → Actions → add five secrets:
+   - `CRYPTO_SUPABASE_URL`
+   - `CRYPTO_SUPABASE_ANON_KEY`
+   - `STOCK_SUPABASE_URL`
+   - `STOCK_SUPABASE_ANON_KEY`
+   - `HEALTH_WEBHOOK_URL`
+3. Actions → Bot Health Monitor → Run workflow (manual trigger to test)
 
-| Transition | Discord ping? |
-|---|---|
-| 🟢 → 🟡 / 🔴 | Yes, immediately |
-| 🟡 / 🔴 → 🟢 | Yes, "recovered" message |
-| Stays 🟡 / 🔴 | At most once per 6 hours |
-| `muted` | Never alerts |
+See `monitor/README.md`-style notes inline in `health_check.py`.
 
-## Setup
-
-### 1. Push to a new repo
+### Dashboard (Next.js + Vercel)
 
 ```bash
-git init
-git add .
-git commit -m "initial health monitor"
-gh repo create bot-health-monitor --private --push --source=.
+cd dashboard
+npm install
+cp .env.local.example .env.local
+# fill in .env.local with Supabase URLs + anon keys
+npm run dev
+# visit http://localhost:3000
 ```
 
-### 2. Get your Supabase anon keys
+### Deploy dashboard to Vercel
 
-You need the **anon key** (NOT the service role key). Find it at:
-- Supabase project → Settings → API → Project API keys → `anon public`
+1. Push this repo to GitHub
+2. vercel.com → Add New Project → import this repo
+3. **IMPORTANT:** under "Configure Project," set **Root Directory** to `dashboard`
+4. Add env vars (same names as `.env.local.example`)
+5. Deploy
 
-Anon keys are safe to commit only if your tables have RLS enabled. Even though we're not committing them (they go in GitHub Secrets), use anon over service role since this monitor only reads.
+Each env var must be `NEXT_PUBLIC_*` since they're used client-side.
 
-### 3. Create a Discord webhook
+---
 
-1. Discord server → channel for health alerts → Edit Channel → Integrations → Webhooks → New Webhook
-2. Copy the webhook URL
-3. (Suggestion: name the channel `#bot-health` and the webhook `Health Monitor`)
+## What the dashboard shows
 
-### 4. Add GitHub Secrets
+- **Aggregate status banner** — one big word: ALL.SYSTEMS.GO / DEGRADED.PERFORMANCE / ALERT.STATE
+- **Per-bot panels** — status + key metrics (last run age, errors in last 6h, stuck runs)
+- **Run history** — last 12 runs per bot with status + age
+- **Aggregate error log** — last 15 errors across both bots, sorted newest first
 
-Repo settings → Secrets and variables → Actions → New repository secret. Add five:
-
-| Secret | Value |
-|---|---|
-| `CRYPTO_SUPABASE_URL` | `https://yourproject.supabase.co` (crypto project) |
-| `CRYPTO_SUPABASE_ANON_KEY` | anon key from crypto project |
-| `STOCK_SUPABASE_URL` | `https://yourproject.supabase.co` (stock project) |
-| `STOCK_SUPABASE_ANON_KEY` | anon key from stock project |
-| `HEALTH_WEBHOOK_URL` | Discord webhook URL |
-
-### 5. Trigger first run
-
-Either wait 30 min for the cron, or trigger manually:
-- Repo → Actions → Bot Health Monitor → Run workflow
-
-You should see something like:
-```
-🟢 Crypto: healthy · last run 12m ago · errors_6h=0 · stuck=0
-⚪ Stock:  muted    · last run — ago · errors_6h=0 · stuck=0
-    └── outside market hours — checks suppressed
-```
-
-If both are healthy, no Discord ping fires (correct — no news is good news).
-
-## Local testing
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# fill in .env with real values
-export $(cat .env | xargs)
-python health_check.py
-```
-
-## Tuning thresholds
-
-All in `health_check.py` near the top:
-
-```python
-COOLDOWN_HOURS = 6   # max alert frequency for stuck bad state
-```
-
-```python
-BotConfig(
-    name="Crypto",
-    expected_minutes=30,    # threshold for "no run" alerts
-    market_hours_only=False,
-)
-```
-
-Bump `expected_minutes` if you get false-positive alerts during occasional GHA latency.
+Auto-refreshes every 60 seconds.
 
 ## Adding a third bot
 
-Append another `BotConfig` to the `BOTS` list in `health_check.py`, add the matching env vars to `.env.example` and the workflow YAML.
+In `monitor/health_check.py`: append a new `BotConfig` to `BOTS`.
+In `dashboard/components/HealthDashboard.jsx`: append a new entry to the `BOTS` array.
 
-## What this monitor doesn't do
+Both expect: `bot_runs` table with a "started_at"-equivalent column and `status` column, `bot_errors` table with a "created_at"-equivalent column. Schema column names are configurable per bot.
 
-- Doesn't check that trades are *good*, only that the bot is *running*. P&L analysis happens in the trading dashboards.
-- Doesn't check Public/brokerage API health directly. If Public's API dies, the bot will log errors → which this monitor will see → and alert. So it works indirectly.
-- Doesn't restart the bot. Just notifies you. Restarting is manual (re-trigger the workflow or push a fix).
+## Notes
 
-## Status state file
-
-`status_state.json` is persisted via GHA cache between runs. It tracks the last-seen status per bot and the last alert timestamp. This is what enables the de-dup logic. If the cache is ever lost, worst case is one duplicate alert.
+- The dashboard reads Supabase directly from the browser via anon key. Anyone with the dashboard URL can read your bot run history. If that's a concern, password-protect on Vercel or keep the URL private.
+- The monitor uses anon keys too (read-only via RLS).
+- `status_state.json` in the monitor is persisted via GHA cache between runs to track last-known-status per bot. If the cache is ever lost, worst case is one duplicate Discord ping.

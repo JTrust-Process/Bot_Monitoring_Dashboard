@@ -14,6 +14,9 @@ jobs:
   health-check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: monitor   # all `run:` steps execute from monitor/
 
     steps:
       - name: Checkout
@@ -22,7 +25,7 @@ jobs:
       - name: Restore status state
         uses: actions/cache/restore@v4
         with:
-          path: status_state.json
+          path: monitor/status_state.json
           key: bot-health-state-${{ github.run_id }}
           restore-keys: |
             bot-health-state-
@@ -32,19 +35,17 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: monitor/requirements.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run health check
         env:
-          # Crypto bot Supabase
           CRYPTO_SUPABASE_URL:      ${{ secrets.CRYPTO_SUPABASE_URL }}
           CRYPTO_SUPABASE_ANON_KEY: ${{ secrets.CRYPTO_SUPABASE_ANON_KEY }}
-          # Stock bot Supabase
           STOCK_SUPABASE_URL:       ${{ secrets.STOCK_SUPABASE_URL }}
           STOCK_SUPABASE_ANON_KEY:  ${{ secrets.STOCK_SUPABASE_ANON_KEY }}
-          # Discord
           HEALTH_WEBHOOK_URL:       ${{ secrets.HEALTH_WEBHOOK_URL }}
         run: python health_check.py
 
@@ -52,5 +53,5 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: status_state.json
+          path: monitor/status_state.json
           key: bot-health-state-${{ github.run_id }}

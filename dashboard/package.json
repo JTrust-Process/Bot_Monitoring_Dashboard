@@ -1,0 +1,16 @@
+{
+  "name": "bot-health-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "next": "15.2.8",
+    "react": "^18",
+    "react-dom": "^18"
+  }
+}
