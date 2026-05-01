@@ -2,7 +2,7 @@ name: Bot Health Monitor
 
 on:
   schedule:
-    - cron: "13,43 * * * *"
+    - cron: "13,43 * * * *"   # offset from :00/:30 to avoid GHA peak load
   workflow_dispatch: {}
 
 # Prevent overlapping runs
@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 5
     defaults:
       run:
-        working-directory: monitor   # all `run:` steps execute from monitor/
+        working-directory: monitor
 
     steps:
       - name: Checkout
@@ -47,6 +47,7 @@ jobs:
           STOCK_SUPABASE_URL:       ${{ secrets.STOCK_SUPABASE_URL }}
           STOCK_SUPABASE_ANON_KEY:  ${{ secrets.STOCK_SUPABASE_ANON_KEY }}
           HEALTH_WEBHOOK_URL:       ${{ secrets.HEALTH_WEBHOOK_URL }}
+          GH_PAT_BOT_RESTART:       ${{ secrets.GH_PAT_BOT_RESTART }}
         run: python health_check.py
 
       - name: Save status state

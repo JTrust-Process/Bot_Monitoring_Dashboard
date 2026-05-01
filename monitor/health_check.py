@@ -32,6 +32,11 @@ from supabase import create_client
 STATE_FILE     = "status_state.json"
 COOLDOWN_HOURS = 6  # max alert frequency while bot stays in same bad state
 
+# ── Recovery rate limits ────────────────────────────────────────────────
+MIN_MINUTES_BETWEEN_RESTARTS = 60      # min gap between auto-restarts per bot
+PANIC_RESTART_THRESHOLD       = 3       # restarts in 24h that triggers panic mode
+PANIC_WINDOW_HOURS            = 24
+
 # Stock market hours (Mon-Fri 9:30am-4:00pm ET = 13:30-20:00 UTC during EST,
 # 14:30-21:00 UTC during EDT). We use 13:30-21:00 UTC to cover both with margin.
 MARKET_OPEN_UTC  = time(13, 30)
@@ -48,6 +53,15 @@ class BotConfig:
     # Schema differences between bots — column names vary
     runs_started_col:      str = "started_at"   # bot_runs: when did the run start
     errors_ts_col:         str = "created_at"   # bot_errors: when was error logged
+    # ── Recovery configuration ──
+    bot_repo_owner:        str = ""             # GitHub owner of the bot's repo
+    bot_repo_name:         str = ""             # repo name with the workflow
+    bot_workflow_file:     str = ""             # workflow filename, e.g. "crypto_bot.yml"
+    restart_enabled:       bool = False         # require explicit opt-in
+    # ── Optional: Trade activity tracking ──
+    trades_table:          Optional[str] = None # e.g. "crypto_trades", or None to skip
+    trades_ts_col:         str = "created_at"
+    low_activity_days:     int = 7              # alert if no trades in this window
 
 @dataclass
 class BotStatus:
@@ -68,6 +82,12 @@ BOTS = [
         expected_minutes=30,    # 15-min cadence + buffer
         market_hours_only=False,
         # Crypto bot uses default schema: started_at / created_at
+        bot_repo_owner="JTrust-Process",       
+        bot_repo_name="Crypto_Trading_Bot",    
+        bot_workflow_file="crypto_bot.yaml",   
+        restart_enabled=True,
+        trades_table="crypto_trades",
+        trades_ts_col="created_at",
     ),
     BotConfig(
         name="Stock",
@@ -78,6 +98,12 @@ BOTS = [
         # Stock bot has different column names
         runs_started_col="start_time",
         errors_ts_col="timestamp",
+        bot_repo_owner="JTrust-Process",       
+        bot_repo_name="Trading-Bot-Project",    
+        bot_workflow_file="trading-bot.yml",     
+        restart_enabled=True,
+        trades_table="trades",
+        trades_ts_col="timestamp",
     ),
 ]
 
@@ -303,16 +329,182 @@ def should_alert(prev: dict, current: BotStatus, now_utc: datetime) -> tuple[boo
     return False, ""
 
 
+# ── Recovery actions ──────────────────────────────────────────────────────────
+
+def trigger_workflow_dispatch(cfg: BotConfig, pat: str) -> tuple[bool, str]:
+    """
+    Triggers a manual workflow run via GitHub API.
+    Returns (success, message).
+    """
+    if not (cfg.bot_repo_owner and cfg.bot_repo_name and cfg.bot_workflow_file):
+        return False, "missing repo/workflow configuration"
+
+    url = f"https://api.github.com/repos/{cfg.bot_repo_owner}/{cfg.bot_repo_name}/actions/workflows/{cfg.bot_workflow_file}/dispatches"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {pat}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = {"ref": "main"}
+
+    try:
+        resp = requests.post(url, json=body, headers=headers, timeout=15)
+        if resp.status_code == 204:
+            return True, "workflow_dispatch accepted"
+        return False, f"GitHub API returned {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        return False, f"API request failed: {e}"
+
+
+def mark_stuck_runs_abandoned(cfg: BotConfig) -> tuple[int, str]:
+    """
+    Updates stuck `running` rows older than 30 min to `error` status,
+    so the bot's concurrency guard doesn't think a run is in flight.
+    Returns (rows_marked, message).
+    """
+    url = os.getenv(cfg.supabase_url_env)
+    key = os.getenv(cfg.supabase_key_env)
+    if not url or not key:
+        return 0, "no supabase creds"
+
+    sb = create_client(url, key)
+    threshold = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+
+    try:
+        # Find stuck runs first (so we can count them and log)
+        stuck = sb.table("bot_runs").select("id").eq(
+            "status", "running"
+        ).lt(cfg.runs_started_col, threshold).execute()
+        count = len(stuck.data) if stuck.data else 0
+
+        if count == 0:
+            return 0, "no stuck runs to clean"
+
+        # Mark them abandoned
+        sb.table("bot_runs").update({
+            "status": "error",
+            "notes":  "marked abandoned by health monitor (stuck > 30 min)",
+        }).eq("status", "running").lt(cfg.runs_started_col, threshold).execute()
+
+        return count, f"marked {count} stuck run(s) as abandoned"
+    except Exception as e:
+        return 0, f"cleanup failed: {e}"
+
+
+def check_low_activity(cfg: BotConfig, now_utc: datetime) -> Optional[int]:
+    """
+    Returns days since last trade (None if trade table not configured or query fails).
+    Used for option-B alerts (long-running strategy producing no trades).
+    """
+    if not cfg.trades_table:
+        return None
+    url = os.getenv(cfg.supabase_url_env)
+    key = os.getenv(cfg.supabase_key_env)
+    if not url or not key:
+        return None
+
+    sb = create_client(url, key)
+    try:
+        resp = sb.table(cfg.trades_table).select(cfg.trades_ts_col).order(
+            cfg.trades_ts_col, desc=True
+        ).limit(1).execute()
+        if not (resp.data and isinstance(resp.data, list) and isinstance(resp.data[0], dict)):
+            return None
+        ts = resp.data[0].get(cfg.trades_ts_col)
+        if not isinstance(ts, str):
+            return None
+        last_trade = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return int((now_utc - last_trade).total_seconds() / 86400)
+    except Exception:
+        return None
+
+
+def should_attempt_restart(prev: dict, current: BotStatus, now_utc: datetime, cfg: BotConfig) -> tuple[bool, str]:
+    """
+    Decides whether the monitor should auto-restart this bot right now.
+    Returns (should_restart, reason).
+    """
+    if not cfg.restart_enabled:
+        return False, "restart not enabled for this bot"
+
+    # Only restart for "down" — never for degraded or muted
+    if current.status != "down":
+        return False, f"status is {current.status}, not 'down'"
+
+    # Don't restart if it's the "no trades for a week" reason — that's not a restart problem
+    if current.minutes_since_run is not None and current.minutes_since_run < cfg.expected_minutes * 2:
+        return False, "down due to errors, not stale runs — restart won't help"
+
+    # Panic mode check
+    if prev.get("panic_mode"):
+        return False, "PANIC MODE: too many recent restarts, manual intervention required"
+
+    # Rate limit
+    last_restart_iso = prev.get("last_restart_at")
+    if last_restart_iso:
+        try:
+            last_restart = datetime.fromisoformat(last_restart_iso)
+            mins_since = (now_utc - last_restart).total_seconds() / 60
+            if mins_since < MIN_MINUTES_BETWEEN_RESTARTS:
+                return False, f"last restart was {mins_since:.0f} min ago (min gap {MIN_MINUTES_BETWEEN_RESTARTS})"
+        except Exception:
+            pass  # if parse fails, allow restart
+
+    return True, "down + outside cooldown"
+
+
+def record_restart(state_entry: dict, now_utc: datetime) -> dict:
+    """
+    Updates state to record that we just attempted a restart.
+    Trims old restart timestamps to keep only the panic window worth.
+    """
+    history = state_entry.get("restart_history", [])
+    history.append(now_utc.isoformat())
+
+    # Keep only restarts within panic window
+    cutoff = now_utc - timedelta(hours=PANIC_WINDOW_HOURS)
+    history = [t for t in history if datetime.fromisoformat(t) >= cutoff]
+
+    state_entry["last_restart_at"] = now_utc.isoformat()
+    state_entry["restart_history"] = history
+    state_entry["restart_count_24h"] = len(history)
+
+    # Engage panic mode if we hit threshold
+    if len(history) >= PANIC_RESTART_THRESHOLD:
+        state_entry["panic_mode"] = True
+
+    return state_entry
+
+
+def send_recovery_notice(webhook: str, bot_name: str, action: str, detail: str) -> None:
+    """One-line Discord notice for recovery actions."""
+    if not webhook:
+        return
+    embed = {
+        "title": f"🔧 Recovery Action: {bot_name}",
+        "description": f"**{action}**\n{detail}",
+        "color": 0x4f46e5,  # indigo to distinguish from alerts
+        "footer": {"text": f"Bot Health Monitor · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"},
+    }
+    try:
+        requests.post(webhook, json={"embeds": [embed]}, timeout=10)
+    except Exception as e:
+        print(f"[discord] recovery notice failed: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
     now_utc = datetime.now(timezone.utc)
     webhook = os.getenv("HEALTH_WEBHOOK_URL", "")
+    pat     = os.getenv("GH_PAT_BOT_RESTART", "")
 
     state    = load_status_state()
     statuses = []
+    bot_cfgs = {}  # name -> cfg, for recovery lookup
 
     for cfg in BOTS:
+        bot_cfgs[cfg.name] = cfg
         s = check_bot(cfg, now_utc)
         statuses.append(s)
         emoji = STATUS_EMOJI.get(s.status, "❓")
@@ -322,8 +514,8 @@ def main() -> int:
             for r in s.reasons:
                 print(f"    └── {r}")
 
-    # Decide alerts
-    alerts:    list[BotStatus] = []
+    # Decide alerts and recoveries
+    alerts:     list[BotStatus] = []
     recoveries: list[BotStatus] = []
     new_state = dict(state)
 
@@ -331,11 +523,10 @@ def main() -> int:
         prev = state.get(s.name, {})
         should_send, event = should_alert(prev, s, now_utc)
 
-        # Update state regardless of whether we ping
-        new_state[s.name] = {
-            "status": s.status,
-            "last_alert_at": prev.get("last_alert_at"),
-        }
+        # Preserve recovery state (last_restart_at, restart_history, panic_mode)
+        # Don't blow these away — they need to persist across runs
+        new_state[s.name] = dict(prev)
+        new_state[s.name]["status"] = s.status
 
         if should_send:
             if event == "alert":
@@ -350,6 +541,63 @@ def main() -> int:
         send_discord_alert(webhook, alerts, "alert")
     if recoveries:
         send_discord_alert(webhook, recoveries, "recovered")
+
+    # ── RECOVERY ACTIONS ────────────────────────────────────────────────
+    for s in statuses:
+        cfg  = bot_cfgs[s.name]
+        prev = new_state.get(s.name, {})
+
+        # ─── 1. Mark stuck runs as abandoned (always safe, no PAT needed)
+        if s.stuck_runs > 0:
+            count, msg = mark_stuck_runs_abandoned(cfg)
+            print(f"[recovery] {s.name}: {msg}")
+            if count > 0:
+                send_recovery_notice(webhook, s.name, "Stuck runs abandoned", msg)
+
+        # ─── 2. Auto-restart if conditions warrant it
+        should_restart, restart_reason = should_attempt_restart(prev, s, now_utc, cfg)
+
+        if should_restart:
+            if not pat:
+                print(f"[recovery] {s.name}: would restart but GH_PAT_BOT_RESTART not set")
+                send_recovery_notice(webhook, s.name, "Restart skipped",
+                                     "PAT not configured — set GH_PAT_BOT_RESTART secret to enable")
+            else:
+                print(f"[recovery] {s.name}: triggering workflow_dispatch ({restart_reason})")
+                ok, msg = trigger_workflow_dispatch(cfg, pat)
+                if ok:
+                    new_state[s.name] = record_restart(new_state[s.name], now_utc)
+                    panic = new_state[s.name].get("panic_mode", False)
+                    detail = f"Restart #{new_state[s.name]['restart_count_24h']} in last 24h"
+                    if panic:
+                        detail += " · ⚠ PANIC MODE engaged — auto-restart now disabled until manual reset"
+                    send_recovery_notice(webhook, s.name, "Auto-restart triggered", detail)
+                else:
+                    print(f"[recovery] {s.name}: restart FAILED — {msg}")
+                    send_recovery_notice(webhook, s.name, "Restart failed", msg)
+        else:
+            if cfg.restart_enabled and s.status == "down":
+                print(f"[recovery] {s.name}: not restarting — {restart_reason}")
+
+        # ─── 3. Low-activity check (Option B: alert only, no auto-action)
+        days_since = check_low_activity(cfg, now_utc)
+        if days_since is not None and days_since >= cfg.low_activity_days:
+            # Dedup: only fire this once per low-activity episode
+            last_low = prev.get("last_low_activity_alert")
+            already_alerted = False
+            if last_low:
+                try:
+                    last_dt = datetime.fromisoformat(last_low)
+                    already_alerted = (now_utc - last_dt).total_seconds() / 86400 < cfg.low_activity_days
+                except Exception:
+                    pass
+            if not already_alerted:
+                send_recovery_notice(
+                    webhook, s.name, "Low trade activity",
+                    f"No trades in {days_since} days. Strategy filters may be suppressing signals — "
+                    f"this is informational, no auto-action taken."
+                )
+                new_state[s.name]["last_low_activity_alert"] = now_utc.isoformat()
 
     save_status_state(new_state)
 
