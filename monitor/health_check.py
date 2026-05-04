@@ -93,7 +93,7 @@ BOTS = [
         name="Stock",
         supabase_url_env="STOCK_SUPABASE_URL",
         supabase_key_env="STOCK_SUPABASE_ANON_KEY",
-        expected_minutes=90,    # hourly cadence + buffer
+        expected_minutes=75,    # hourly cadence + buffer
         market_hours_only=True,
         # Stock bot has different column names
         runs_started_col="start_time",
