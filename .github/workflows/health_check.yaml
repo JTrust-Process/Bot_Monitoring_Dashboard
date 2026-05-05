@@ -47,6 +47,7 @@ jobs:
           STOCK_SUPABASE_URL:       ${{ secrets.STOCK_SUPABASE_URL }}
           STOCK_SUPABASE_ANON_KEY:  ${{ secrets.STOCK_SUPABASE_ANON_KEY }}
           HEALTH_WEBHOOK_URL:       ${{ secrets.HEALTH_WEBHOOK_URL }}
+          GH_PAT_BOT_RESTART:       ${{ secrets.GH_PAT_BOT_RESTART }}
         run: python health_check.py
 
       - name: Save status state
