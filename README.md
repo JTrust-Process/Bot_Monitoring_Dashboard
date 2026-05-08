@@ -2,13 +2,13 @@
 
 Monorepo containing two pieces:
 
-- **`monitor/`** — Python script + GHA workflow. Runs every 30 min, queries both bots' Supabase projects, pings Discord on issues.
+- **`monitor/`** — Python script + GHA workflow. Runs every 15 min, queries both bots' Supabase projects, pings Discord on issues.
 - **`dashboard/`** — Next.js 15 app deployed to Vercel. Brutalist mission-control UI showing live health status of both bots.
 
 ```
 bot-health-monitor/
 ├── .github/workflows/
-│   └── health_check.yml      # GHA cron — runs monitor/health_check.py every 30 min
+│   └── health_check.yaml     # GHA cron — runs monitor/health_check.py every 15 min
 ├── monitor/
 │   ├── health_check.py       # the Python check + Discord pinger
 │   ├── requirements.txt
@@ -30,13 +30,16 @@ bot-health-monitor/
 Runs in this repo automatically. Setup is just secrets:
 
 1. Create a Discord channel for health alerts → add a webhook → copy URL
-2. In this repo: Settings → Secrets and variables → Actions → add five secrets:
+2. In this repo: Settings → Secrets and variables → Actions → add the secrets:
    - `CRYPTO_SUPABASE_URL`
    - `CRYPTO_SUPABASE_ANON_KEY`
    - `STOCK_SUPABASE_URL`
    - `STOCK_SUPABASE_ANON_KEY`
    - `HEALTH_WEBHOOK_URL`
+   - `GH_PAT_BOT_RESTART` *(optional — only required if you opt-in to auto-restart by setting `restart_enabled=True` on a `BotConfig` in `health_check.py`. Disabled by default.)*
 3. Actions → Bot Health Monitor → Run workflow (manual trigger to test)
+
+> **Auto-restart and stuck-run cleanup are OFF by default.** They are gated behind explicit per-bot flags (`restart_enabled`, `cleanup_stuck_enabled`) on each `BotConfig` and additionally require the right credentials. Do not enable them without understanding the risk: a financial trading bot being auto-restarted during an incident can cause wrong-state issues.
 
 See `monitor/README.md`-style notes inline in `health_check.py`.
 

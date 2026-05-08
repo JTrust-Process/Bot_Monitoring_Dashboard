@@ -7,6 +7,11 @@ import { createClient } from "@supabase/supabase-js";
 //  CONFIGURATION
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Thresholds kept in sync with monitor/health_check.py.
+const ERRORS_6H_DEGRADED = 2;
+const ERRORS_6H_DOWN     = 5;
+const STUCK_RUN_MINUTES  = 60;
+
 const BOTS = [
   {
     id:   "crypto",
@@ -16,7 +21,7 @@ const BOTS = [
     supabaseUrl: process.env.NEXT_PUBLIC_CRYPTO_SUPABASE_URL,
     supabaseKey: process.env.NEXT_PUBLIC_CRYPTO_SUPABASE_ANON_KEY,
     cols: { runStarted: "started_at", runEnded: "ended_at", errorTs: "created_at" },
-    expectedMinutes: 30,
+    expectedMinutes: 45,    // 15-min cadence + buffer for GHA drift
     cadence: "every 15 minutes",
     marketHoursOnly: false,
   },
@@ -28,11 +33,18 @@ const BOTS = [
     supabaseUrl: process.env.NEXT_PUBLIC_STOCK_SUPABASE_URL,
     supabaseKey: process.env.NEXT_PUBLIC_STOCK_SUPABASE_ANON_KEY,
     cols: { runStarted: "start_time",  runEnded: "end_time",  errorTs: "timestamp" },
-    expectedMinutes: 90,
+    expectedMinutes: 90,    // hourly cadence + buffer for GHA drift
     cadence: "every hour, market hours",
     marketHoursOnly: true,
   },
 ];
+
+// 2026 NYSE full-day closures. Update yearly. Must mirror monitor/health_check.py.
+const NYSE_HOLIDAYS_ISO = new Set([
+  "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+  "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+  "2026-11-26", "2026-12-25",
+]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  UTILITIES
@@ -58,12 +70,27 @@ const fmtDate = (iso) => {
   return `${String(d.getUTCMonth() + 1).padStart(2, "0")}/${String(d.getUTCDate()).padStart(2, "0")}`;
 };
 
+// NYSE 9:30–16:00 America/New_York, Mon–Fri, excluding NYSE_HOLIDAYS_ISO.
+// Uses Intl so DST is handled correctly — avoids the union-of-EST/EDT bug
+// that flagged false "down" on edge UTC hours.
 const inMarketHours = () => {
   const now = new Date();
-  const utcDay = now.getUTCDay();
-  const utcMin = now.getUTCHours() * 60 + now.getUTCMinutes();
-  if (utcDay === 0 || utcDay === 6) return false;
-  return utcMin >= 13 * 60 + 30 && utcMin <= 21 * 60;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(now).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+
+  if (parts.weekday === "Sat" || parts.weekday === "Sun") return false;
+  const isoDate = `${parts.year}-${parts.month}-${parts.day}`;
+  if (NYSE_HOLIDAYS_ISO.has(isoDate)) return false;
+
+  // Intl returns "24" for midnight in en-US 24h — normalise.
+  const hour = parts.hour === "24" ? 0 : parseInt(parts.hour, 10);
+  const min  = parseInt(parts.minute, 10);
+  const total = hour * 60 + min;
+  return total >= 9 * 60 + 30 && total <= 16 * 60;
 };
 
 function deriveStatus(bot, runs, errors) {
@@ -104,21 +131,21 @@ function deriveStatus(bot, runs, errors) {
   const recentErrors = errors.filter(e => new Date(e[bot.cols.errorTs]).getTime() >= sixHrAgo);
   const errCount = recentErrors.length;
 
-  if (errCount >= 3) {
+  if (errCount >= ERRORS_6H_DOWN) {
     status = "bad"; label = "Down";
     reasons.push(`${errCount} errors in the last six hours.`);
-  } else if (errCount >= 1 && status === "ok") {
+  } else if (errCount >= ERRORS_6H_DEGRADED && status === "ok") {
     status = "warn"; label = "Degraded";
     reasons.push(`${errCount} error${errCount > 1 ? "s" : ""} in the last six hours.`);
   }
 
-  const stuckThreshold = Date.now() - 30 * 60 * 1000;
+  const stuckThreshold = Date.now() - STUCK_RUN_MINUTES * 60 * 1000;
   const stuck = runs.filter(r => r.status === "running" &&
     new Date(r[bot.cols.runStarted]).getTime() < stuckThreshold);
 
   if (stuck.length > 0) {
     status = "bad"; label = "Down";
-    reasons.push(`${stuck.length} cycle${stuck.length > 1 ? "s" : ""} running over 30 minutes.`);
+    reasons.push(`${stuck.length} cycle${stuck.length > 1 ? "s" : ""} running over ${STUCK_RUN_MINUTES} minutes.`);
   }
 
   if (reasons.length === 0) reasons.push("All checks passing.");

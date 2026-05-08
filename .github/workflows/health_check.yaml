@@ -2,7 +2,7 @@ name: Bot Health Monitor
 
 on:
   schedule:
-    - cron: "8,23,38,53 * * * *"   # every 15 min, offset from peak load
+    - cron: "8,23,38,53 * * * *"   # every 15 min, offset from peak load (GHA cron drift can be 15–60 min)
   workflow_dispatch: {}
 
 # Prevent overlapping runs
@@ -26,7 +26,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: monitor/status_state.json
-          key: bot-health-state-${{ github.run_id }}
+          key: bot-health-state-v1
           restore-keys: |
             bot-health-state-
 
@@ -55,4 +55,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: monitor/status_state.json
-          key: bot-health-state-${{ github.run_id }}
+          key: bot-health-state-v1-${{ github.run_id }}-${{ github.run_attempt }}

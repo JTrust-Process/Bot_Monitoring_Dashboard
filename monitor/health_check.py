@@ -3,7 +3,7 @@ bot-health-monitor / health_check.py
 
 Reads run/error data from both bots' Supabase projects and pings Discord
 when a bot is down or degraded. De-duplicates alerts so a stuck bot doesn't
-spam every 30 minutes.
+spam every cooldown cycle.
 
 State:
   status_state.json — persisted via GHA cache; remembers last-known status
@@ -11,17 +11,25 @@ State:
                       every COOLDOWN_HOURS while still in a bad state.
 
 Run cadence:
-  This workflow runs every 30 minutes.
+  This workflow runs every 15 minutes (cron: 8,23,38,53 * * * *).
   Crypto bot expected cadence: every 15 min, 24/7
-  Stock bot expected cadence: every 1 hour, market hours only (Mon-Fri 13:30-21:00 UTC)
+  Stock bot  expected cadence: every 1 hour, market hours only (NYSE)
+
+Recovery behaviour:
+  Auto-restart and stuck-run cleanup are DISABLED by default. They require
+  explicit opt-in via BotConfig.restart_enabled / cleanup_stuck_enabled
+  AND the GH_PAT_BOT_RESTART secret (for restart) or service-role write
+  access (for stuck-run cleanup). See issues #3 / #10 in the audit.
 """
 
 import json
 import os
 import sys
+import time as time_module
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from supabase import create_client
@@ -32,15 +40,36 @@ from supabase import create_client
 STATE_FILE     = "status_state.json"
 COOLDOWN_HOURS = 6  # max alert frequency while bot stays in same bad state
 
-# ── Recovery rate limits ────────────────────────────────────────────────
+# ── Error / stuck-run thresholds ─────────────────────────────────────────────
+# Tuned for current GitHub Actions cron reliability (15–60 min drift is normal).
+ERRORS_6H_DEGRADED  = 2
+ERRORS_6H_DOWN      = 5
+STUCK_RUN_MINUTES   = 60   # was 30 — too tight for hourly stock bot
+
+# ── Recovery rate limits ──────────────────────────────────────────────────────
 MIN_MINUTES_BETWEEN_RESTARTS = 60      # min gap between auto-restarts per bot
 PANIC_RESTART_THRESHOLD       = 3       # restarts in 24h that triggers panic mode
 PANIC_WINDOW_HOURS            = 24
 
-# Stock market hours (Mon-Fri 9:30am-4:00pm ET = 13:30-20:00 UTC during EST,
-# 14:30-21:00 UTC during EDT). We use 13:30-21:00 UTC to cover both with margin.
-MARKET_OPEN_UTC  = time(13, 30)
-MARKET_CLOSE_UTC = time(21, 0)
+# ── Stock market hours (NYSE) ─────────────────────────────────────────────────
+NY               = ZoneInfo("America/New_York")
+MARKET_OPEN_NY   = time(9, 30)
+MARKET_CLOSE_NY  = time(16, 0)
+
+# 2026 NYSE full-day closures. Update yearly.
+# Source: NYSE official holiday schedule.
+NYSE_HOLIDAYS = {
+    date(2026, 1, 1),    # New Year's Day
+    date(2026, 1, 19),   # MLK Day
+    date(2026, 2, 16),   # Presidents' Day
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 5, 25),   # Memorial Day
+    date(2026, 6, 19),   # Juneteenth
+    date(2026, 7, 3),    # Independence Day (observed)
+    date(2026, 9, 7),    # Labor Day
+    date(2026, 11, 26),  # Thanksgiving
+    date(2026, 12, 25),  # Christmas
+}
 
 
 @dataclass
@@ -48,20 +77,26 @@ class BotConfig:
     name:                  str    # e.g. "Crypto" / "Stock"
     supabase_url_env:      str    # env var holding the URL
     supabase_key_env:      str    # env var holding the anon key
-    expected_minutes:      int    # max minutes between runs before "down"
+    expected_minutes:      int    # max minutes between runs before "degraded"
     market_hours_only:     bool   # if True, suppress alerts outside market hours
-    # Schema differences between bots — column names vary
+    # Schema differences between bots — column names + table names vary
+    runs_table:            str = "bot_runs"
+    errors_table:          str = "bot_errors"
     runs_started_col:      str = "started_at"   # bot_runs: when did the run start
+    runs_status_col:       str = "status"        # bot_runs: status column
+    runs_running_val:      str = "running"       # value indicating in-flight run
     errors_ts_col:         str = "created_at"   # bot_errors: when was error logged
-    # ── Recovery configuration ──
+    # ── Recovery configuration (OFF by default; see audit #3 / #10) ──
     bot_repo_owner:        str = ""             # GitHub owner of the bot's repo
     bot_repo_name:         str = ""             # repo name with the workflow
     bot_workflow_file:     str = ""             # workflow filename, e.g. "crypto_bot.yml"
     restart_enabled:       bool = False         # require explicit opt-in
+    cleanup_stuck_enabled: bool = False         # require explicit opt-in (does UPDATE)
     # ── Optional: Trade activity tracking ──
     trades_table:          Optional[str] = None # e.g. "crypto_trades", or None to skip
     trades_ts_col:         str = "created_at"
     low_activity_days:     int = 7              # alert if no trades in this window
+
 
 @dataclass
 class BotStatus:
@@ -79,13 +114,14 @@ BOTS = [
         name="Crypto",
         supabase_url_env="CRYPTO_SUPABASE_URL",
         supabase_key_env="CRYPTO_SUPABASE_ANON_KEY",
-        expected_minutes=30,    # 15-min cadence + buffer
+        expected_minutes=45,    # 15-min cadence + buffer for GHA drift
         market_hours_only=False,
         # Crypto bot uses default schema: started_at / created_at
-        bot_repo_owner="JTrust-Process",       
-        bot_repo_name="Crypto_Trading_Bot",    
-        bot_workflow_file="crypto_bot.yaml",   
-        restart_enabled=True,
+        bot_repo_owner="JTrust-Process",
+        bot_repo_name="Crypto_Trading_Bot",
+        bot_workflow_file="crypto_bot.yaml",
+        restart_enabled=False,        # OFF until explicitly approved
+        cleanup_stuck_enabled=False,  # OFF until anon-key write story is verified
         trades_table="crypto_trades",
         trades_ts_col="created_at",
     ),
@@ -93,15 +129,16 @@ BOTS = [
         name="Stock",
         supabase_url_env="STOCK_SUPABASE_URL",
         supabase_key_env="STOCK_SUPABASE_ANON_KEY",
-        expected_minutes=75,    # hourly cadence + buffer
+        expected_minutes=90,    # hourly cadence + buffer for GHA drift
         market_hours_only=True,
         # Stock bot has different column names
         runs_started_col="start_time",
         errors_ts_col="timestamp",
-        bot_repo_owner="JTrust-Process",       
-        bot_repo_name="Trading-Bot-Project",    
-        bot_workflow_file="trading-bot.yml",     
-        restart_enabled=True,
+        bot_repo_owner="JTrust-Process",
+        bot_repo_name="Trading-Bot-Project",
+        bot_workflow_file="trading-bot.yml",
+        restart_enabled=False,        # OFF until explicitly approved
+        cleanup_stuck_enabled=False,  # OFF until anon-key write story is verified
         trades_table="trades",
         trades_ts_col="timestamp",
     ),
@@ -128,11 +165,18 @@ def save_status_state(state: dict) -> None:
 # ── Market hours check ────────────────────────────────────────────────────────
 
 def in_market_hours(now_utc: datetime) -> bool:
-    """Mon-Fri 13:30-21:00 UTC. Weekends and off-hours = closed."""
-    if now_utc.weekday() >= 5:  # 5=Sat, 6=Sun
+    """
+    NYSE regular session: Mon–Fri 9:30–16:00 America/New_York.
+    Excludes weekends and the NYSE_HOLIDAYS set above.
+    Uses zoneinfo so DST is handled automatically.
+    """
+    now_ny = now_utc.astimezone(NY)
+    if now_ny.weekday() >= 5:  # 5=Sat, 6=Sun
         return False
-    t = now_utc.time()
-    return MARKET_OPEN_UTC <= t <= MARKET_CLOSE_UTC
+    if now_ny.date() in NYSE_HOLIDAYS:
+        return False
+    t = now_ny.time()
+    return MARKET_OPEN_NY <= t <= MARKET_CLOSE_NY
 
 
 # ── Per-bot check ─────────────────────────────────────────────────────────────
@@ -161,48 +205,59 @@ def check_bot(cfg: BotConfig, now_utc: datetime) -> BotStatus:
         )
 
     reasons: list[str] = []
+    runs_query_failed   = False
+    errors_query_failed = False
+    stuck_query_failed  = False
 
-    # Last completed/started run
+    # Last started run
     last_run_dt: Optional[datetime] = None
     minutes_since: Optional[float]  = None
     try:
-        runs = sb.table("bot_runs").select(f"{cfg.runs_started_col}, status").order(
-            cfg.runs_started_col, desc=True
-        ).limit(1).execute()
+        runs = sb.table(cfg.runs_table).select(
+            f"{cfg.runs_started_col}, {cfg.runs_status_col}"
+        ).order(cfg.runs_started_col, desc=True).limit(1).execute()
         if runs.data and isinstance(runs.data, list) and isinstance(runs.data[0], dict):
             ts = runs.data[0].get(cfg.runs_started_col)
             if isinstance(ts, str):
                 last_run_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 minutes_since = (now_utc - last_run_dt).total_seconds() / 60.0
     except Exception as e:
-        reasons.append(f"bot_runs query failed: {e}")
+        runs_query_failed = True
+        reasons.append(f"{cfg.runs_table} query failed: {e}")
 
-    # Stuck runs: status=running for > 30 min
+    # Stuck runs: status=running for > STUCK_RUN_MINUTES
     stuck_count = 0
     try:
-        stuck_threshold = (now_utc - timedelta(minutes=30)).isoformat()
-        stuck = sb.table("bot_runs").select(f"id, {cfg.runs_started_col}").eq(
-            "status", "running"
-        ).lt(cfg.runs_started_col, stuck_threshold).execute()
-        stuck_count = len(stuck.data) if stuck.data else 0
+        stuck_threshold = (now_utc - timedelta(minutes=STUCK_RUN_MINUTES)).isoformat()
+        stuck = sb.table(cfg.runs_table).select(
+            f"id", count="exact"
+        ).eq(cfg.runs_status_col, cfg.runs_running_val).lt(
+            cfg.runs_started_col, stuck_threshold
+        ).execute()
+        stuck_count = stuck.count or 0
     except Exception as e:
+        stuck_query_failed = True
         reasons.append(f"stuck-runs query failed: {e}")
 
     # Errors in last 6h
     errors_6h = 0
     try:
         since = (now_utc - timedelta(hours=6)).isoformat()
-        errs = sb.table("bot_errors").select("id").gte(cfg.errors_ts_col, since).execute()
-        errors_6h = len(errs.data) if errs.data else 0
+        errs = sb.table(cfg.errors_table).select(
+            "id", count="exact"
+        ).gte(cfg.errors_ts_col, since).execute()
+        errors_6h = errs.count or 0
     except Exception as e:
-        reasons.append(f"bot_errors query failed: {e}")
+        errors_query_failed = True
+        reasons.append(f"{cfg.errors_table} query failed: {e}")
 
-    # Determine status
+    # ── Determine status ──
     status = "healthy"
 
     if minutes_since is None:
         status = "down"
-        reasons.append("no run history found")
+        reasons.append("no run history found" if not runs_query_failed
+                       else "last run unknown (query failed)")
     elif minutes_since > cfg.expected_minutes * 2:
         status = "down"
         reasons.append(f"last run {minutes_since:.0f} min ago (expected ≤{cfg.expected_minutes})")
@@ -210,16 +265,21 @@ def check_bot(cfg: BotConfig, now_utc: datetime) -> BotStatus:
         status = "degraded"
         reasons.append(f"last run {minutes_since:.0f} min ago (expected ≤{cfg.expected_minutes})")
 
-    if errors_6h >= 3:
+    if errors_6h >= ERRORS_6H_DOWN:
         status = "down"
-        reasons.append(f"{errors_6h} errors in last 6h")
-    elif errors_6h >= 1 and status == "healthy":
+        reasons.append(f"{errors_6h} errors in last 6h (≥{ERRORS_6H_DOWN})")
+    elif errors_6h >= ERRORS_6H_DEGRADED and status == "healthy":
         status = "degraded"
-        reasons.append(f"{errors_6h} errors in last 6h")
+        reasons.append(f"{errors_6h} errors in last 6h (≥{ERRORS_6H_DEGRADED})")
 
     if stuck_count > 0:
         status = "down"
-        reasons.append(f"{stuck_count} stuck run(s) > 30 min old")
+        reasons.append(f"{stuck_count} stuck run(s) > {STUCK_RUN_MINUTES} min old")
+
+    # Fail closed on query errors: if a sub-query failed silently, don't claim healthy.
+    if (errors_query_failed or stuck_query_failed) and status == "healthy":
+        status = "degraded"
+        reasons.append("downgraded to degraded: one or more sub-queries failed")
 
     return BotStatus(
         name=cfg.name, status=status,
@@ -238,12 +298,35 @@ STATUS_EMOJI = {
     "muted":    "⚪",
 }
 STATUS_COLOR = {
-    "healthy":  0x1a6b3c,
-    "degraded": 0x92600a,
-    "down":     0xc8391a,
-    "muted":    0x7a7670,
+    "healthy":   0x1a6b3c,
+    "degraded":  0x92600a,
+    "down":      0xc8391a,
+    "muted":     0x7a7670,
     "recovered": 0x1a6b3c,
 }
+
+
+def _post_with_retry(url: str, payload: dict, max_attempts: int = 3) -> Optional[requests.Response]:
+    """POST a JSON payload with exponential backoff on 5xx / network errors."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            # 2xx = good. 4xx = client error, no point retrying.
+            if 200 <= resp.status_code < 300:
+                return resp
+            if 400 <= resp.status_code < 500:
+                print(f"[discord] {resp.status_code} (no retry): {resp.text[:200]}")
+                return resp
+            print(f"[discord] {resp.status_code} on attempt {attempt}: {resp.text[:200]}")
+        except Exception as e:
+            last_exc = e
+            print(f"[discord] attempt {attempt} failed: {e}")
+        if attempt < max_attempts:
+            time_module.sleep(3 ** (attempt - 1))  # 1s, 3s, 9s
+    if last_exc is not None:
+        print(f"[discord] giving up after {max_attempts} attempts: {last_exc}")
+    return None
 
 
 def send_discord_alert(webhook: str, statuses: list[BotStatus], event: str) -> None:
@@ -282,14 +365,9 @@ def send_discord_alert(webhook: str, statuses: list[BotStatus], event: str) -> N
         "footer": {"text": f"Bot Health Monitor · {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"},
     }
 
-    try:
-        resp = requests.post(webhook, json={"embeds": [embed]}, timeout=10)
-        if resp.status_code not in (200, 204):
-            print(f"[discord] Webhook returned {resp.status_code}: {resp.text[:200]}")
-        else:
-            print(f"[discord] {event} alert sent")
-    except Exception as e:
-        print(f"[discord] Send failed: {e}")
+    resp = _post_with_retry(webhook, {"embeds": [embed]})
+    if resp is not None and 200 <= resp.status_code < 300:
+        print(f"[discord] {event} alert sent")
 
 
 # ── De-dup decision logic ─────────────────────────────────────────────────────
@@ -298,11 +376,20 @@ def should_alert(prev: dict, current: BotStatus, now_utc: datetime) -> tuple[boo
     """
     Returns (should_send, event_type).
     event_type: "alert" | "recovered" | ""
+
+    NOTE: prev_status is the *last meaningful* status (we never store "muted"
+    as a transition state; see main()). So a stock bot that was "down" before
+    market close is still "down" in prev_status when market reopens.
     """
-    prev_status        = prev.get("status", "healthy")
+    prev_status         = prev.get("status", "healthy")
     prev_last_alert_iso = prev.get("last_alert_at")
 
-    # Never alert on muted state
+    # Treat unexpected stored values as "healthy" so a bad cache state can't
+    # silently swallow a real alert.
+    if prev_status not in ("healthy", "degraded", "down"):
+        prev_status = "healthy"
+
+    # Never alert on muted state itself
     if current.status == "muted":
         return False, ""
 
@@ -339,7 +426,10 @@ def trigger_workflow_dispatch(cfg: BotConfig, pat: str) -> tuple[bool, str]:
     if not (cfg.bot_repo_owner and cfg.bot_repo_name and cfg.bot_workflow_file):
         return False, "missing repo/workflow configuration"
 
-    url = f"https://api.github.com/repos/{cfg.bot_repo_owner}/{cfg.bot_repo_name}/actions/workflows/{cfg.bot_workflow_file}/dispatches"
+    url = (
+        f"https://api.github.com/repos/{cfg.bot_repo_owner}/{cfg.bot_repo_name}"
+        f"/actions/workflows/{cfg.bot_workflow_file}/dispatches"
+    )
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {pat}",
@@ -358,9 +448,10 @@ def trigger_workflow_dispatch(cfg: BotConfig, pat: str) -> tuple[bool, str]:
 
 def mark_stuck_runs_abandoned(cfg: BotConfig) -> tuple[int, str]:
     """
-    Updates stuck `running` rows older than 30 min to `error` status,
-    so the bot's concurrency guard doesn't think a run is in flight.
-    Returns (rows_marked, message).
+    Updates stuck `running` rows older than STUCK_RUN_MINUTES to `error` status.
+    Requires write access (typically a service-role key, NOT the anon key the
+    monitor uses for reads). DISABLED by default; set cfg.cleanup_stuck_enabled
+    to opt in, and supply credentials with write permission.
     """
     url = os.getenv(cfg.supabase_url_env)
     key = os.getenv(cfg.supabase_key_env)
@@ -368,23 +459,27 @@ def mark_stuck_runs_abandoned(cfg: BotConfig) -> tuple[int, str]:
         return 0, "no supabase creds"
 
     sb = create_client(url, key)
-    threshold = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    threshold = (datetime.now(timezone.utc) - timedelta(minutes=STUCK_RUN_MINUTES)).isoformat()
 
     try:
         # Find stuck runs first (so we can count them and log)
-        stuck = sb.table("bot_runs").select("id").eq(
-            "status", "running"
-        ).lt(cfg.runs_started_col, threshold).execute()
-        count = len(stuck.data) if stuck.data else 0
+        stuck = sb.table(cfg.runs_table).select(
+            "id", count="exact"
+        ).eq(cfg.runs_status_col, cfg.runs_running_val).lt(
+            cfg.runs_started_col, threshold
+        ).execute()
+        count = stuck.count or 0
 
         if count == 0:
             return 0, "no stuck runs to clean"
 
-        # Mark them abandoned
-        sb.table("bot_runs").update({
-            "status": "error",
-            "notes":  "marked abandoned by health monitor (stuck > 30 min)",
-        }).eq("status", "running").lt(cfg.runs_started_col, threshold).execute()
+        # Mark them abandoned. Note: we deliberately do NOT touch a `notes`
+        # column — schemas vary and an unknown column would fail the whole UPDATE.
+        sb.table(cfg.runs_table).update({
+            cfg.runs_status_col: "error",
+        }).eq(
+            cfg.runs_status_col, cfg.runs_running_val
+        ).lt(cfg.runs_started_col, threshold).execute()
 
         return count, f"marked {count} stuck run(s) as abandoned"
     except Exception as e:
@@ -486,10 +581,7 @@ def send_recovery_notice(webhook: str, bot_name: str, action: str, detail: str) 
         "color": 0x4f46e5,  # indigo to distinguish from alerts
         "footer": {"text": f"Bot Health Monitor · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"},
     }
-    try:
-        requests.post(webhook, json={"embeds": [embed]}, timeout=10)
-    except Exception as e:
-        print(f"[discord] recovery notice failed: {e}")
+    _post_with_retry(webhook, {"embeds": [embed]})
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -524,9 +616,14 @@ def main() -> int:
         should_send, event = should_alert(prev, s, now_utc)
 
         # Preserve recovery state (last_restart_at, restart_history, panic_mode)
-        # Don't blow these away — they need to persist across runs
+        # Don't blow these away — they need to persist across runs.
         new_state[s.name] = dict(prev)
-        new_state[s.name]["status"] = s.status
+
+        # IMPORTANT: do NOT overwrite the persisted status with "muted".
+        # Otherwise a degraded/down bot that hits an off-hours window
+        # would lose its prev_status and we'd miss the next transition alert.
+        if s.status != "muted":
+            new_state[s.name]["status"] = s.status
 
         if should_send:
             if event == "alert":
@@ -543,18 +640,22 @@ def main() -> int:
         send_discord_alert(webhook, recoveries, "recovered")
 
     # ── RECOVERY ACTIONS ────────────────────────────────────────────────
+    # Both auto-restart and stuck-run cleanup are gated behind explicit
+    # per-bot flags AND default to disabled. See audit notes.
     for s in statuses:
         cfg  = bot_cfgs[s.name]
         prev = new_state.get(s.name, {})
 
-        # ─── 1. Mark stuck runs as abandoned (always safe, no PAT needed)
-        if s.stuck_runs > 0:
+        # ─── 1. Mark stuck runs as abandoned (requires WRITE access) ──────
+        if s.stuck_runs > 0 and cfg.cleanup_stuck_enabled:
             count, msg = mark_stuck_runs_abandoned(cfg)
             print(f"[recovery] {s.name}: {msg}")
             if count > 0:
                 send_recovery_notice(webhook, s.name, "Stuck runs abandoned", msg)
+        elif s.stuck_runs > 0:
+            print(f"[recovery] {s.name}: {s.stuck_runs} stuck run(s) detected — cleanup disabled (cleanup_stuck_enabled=False)")
 
-        # ─── 2. Auto-restart if conditions warrant it
+        # ─── 2. Auto-restart (DISABLED by default) ─────────────────────────
         should_restart, restart_reason = should_attempt_restart(prev, s, now_utc, cfg)
 
         if should_restart:
@@ -579,7 +680,7 @@ def main() -> int:
             if cfg.restart_enabled and s.status == "down":
                 print(f"[recovery] {s.name}: not restarting — {restart_reason}")
 
-        # ─── 3. Low-activity check (Option B: alert only, no auto-action)
+        # ─── 3. Low-activity check (alert only, no auto-action) ───────────
         days_since = check_low_activity(cfg, now_utc)
         if days_since is not None and days_since >= cfg.low_activity_days:
             # Dedup: only fire this once per low-activity episode
