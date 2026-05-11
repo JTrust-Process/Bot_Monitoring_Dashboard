@@ -45,6 +45,8 @@ export default function RootLayout({ children }) {
             fontSize: 12,
             color: "var(--ink-3)",
           }}>
+            <a href="/" className="tnav">Health</a>
+            <a href="/league" className="tnav">League</a>
             {repoUrl && (
               <a href={repoUrl} target="_blank" rel="noopener noreferrer" className="tnav">
                 Source
