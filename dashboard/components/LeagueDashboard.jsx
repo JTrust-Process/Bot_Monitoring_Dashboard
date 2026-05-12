@@ -12,6 +12,7 @@ const HEARTBEAT_DEGRADED_MIN = 30;   // no heartbeat in N min → degraded
 const HEARTBEAT_DOWN_MIN     = 120;  // no heartbeat in N min → down
 const RUNS_LIMIT             = 30;
 const TRADES_LIMIT           = 30;
+const SCORES_LIMIT           = 60;   // bot_research_scores — fetched, then dedup'd client-side
 
 // Modes that are NOT live → render with a less-loud accent.
 const MODE_LABEL = {
@@ -152,6 +153,7 @@ export default function LeagueDashboard() {
   const [statuses, setStatuses]   = useState([]);
   const [runs, setRuns]           = useState([]);
   const [trades, setTrades]       = useState([]);
+  const [scores, setScores]       = useState([]);
 
   const cfg = getLeagueSupabaseConfig();
   const configured = !!(cfg.url && cfg.key);
@@ -164,17 +166,22 @@ export default function LeagueDashboard() {
     }
     const sb = createLeagueClient();
     try {
-      const [reg, st, rn, tr] = await Promise.all([
+      const [reg, st, rn, tr, sc] = await Promise.all([
         sb.from("bot_registry").select("*").order("bot_id", { ascending: true }),
         sb.from("bot_status").select("*"),
         sb.from("bot_runs").select("*").order("started_at", { ascending: false }).limit(RUNS_LIMIT),
         sb.from("bot_trades").select("*").order("occurred_at", { ascending: false }).limit(TRADES_LIMIT),
+        sb.from("bot_research_scores").select("*").order("scored_at", { ascending: false }).limit(SCORES_LIMIT),
       ]);
       setRegistry(reg.data || []);
       setStatuses(st.data || []);
       setRuns(rn.data || []);
       setTrades(tr.data || []);
-      setFetchErr(reg.error?.message || st.error?.message || rn.error?.message || tr.error?.message || null);
+      setScores(sc.data || []);
+      setFetchErr(
+        reg.error?.message || st.error?.message || rn.error?.message ||
+        tr.error?.message  || sc.error?.message || null
+      );
     } catch (err) {
       setFetchErr(String(err?.message || err));
     } finally {
@@ -318,6 +325,51 @@ export default function LeagueDashboard() {
       </section>
 
       {/* ============================================================
+          RESEARCH SCORES — most recent score per (bot, symbol)
+         ============================================================ */}
+      <section style={{ marginBottom: "var(--s-8)" }}>
+        {(() => {
+          // Dedup: keep the most-recent row per (bot_id, symbol). scores
+          // arrives sorted desc by scored_at so the first occurrence wins.
+          const seen = new Set();
+          const latest = [];
+          for (const s of scores) {
+            const k = `${s.bot_id}|${s.symbol}`;
+            if (seen.has(k)) continue;
+            seen.add(k);
+            latest.push(s);
+          }
+          return (
+            <>
+              <SectionHeader count={latest.length}>Research scores</SectionHeader>
+              {latest.length === 0 ? (
+                <EmptyHint>No research scores yet. Will populate once a research bot writes here.</EmptyHint>
+              ) : (
+                <Table
+                  cols={["Bot", "Symbol", "Class", "Composite", "Classification", "Scored", "Notes"]}
+                  colAlign={["left","left","left","right","left","left","left"]}
+                >
+                  {latest.map(s => (
+                    <tr key={s.id}>
+                      <Td>{displayName(regByBot[s.bot_id])}</Td>
+                      <Td mono>{s.symbol}</Td>
+                      <Td mono>{s.asset_class}</Td>
+                      <Td mono align="right">
+                        {s.score != null ? Number(s.score).toFixed(2) : "—"}
+                      </Td>
+                      <Td><ClassificationBadge classification={s.classification} /></Td>
+                      <Td mono>{fmtDate(s.scored_at)}</Td>
+                      <Td>{s.notes || "—"}</Td>
+                    </tr>
+                  ))}
+                </Table>
+              )}
+            </>
+          );
+        })()}
+      </section>
+
+      {/* ============================================================
           RECENT TRADES
          ============================================================ */}
       <section style={{ marginBottom: "var(--s-8)" }}>
@@ -458,6 +510,33 @@ function RunStatusBadge({ status }) {
         background: color,
       }} />
       {status || "—"}
+    </span>
+  );
+}
+
+function ClassificationBadge({ classification }) {
+  const map = {
+    keep_active:     { color: "var(--ok)",   label: "keep_active" },
+    reduce_priority: { color: "var(--warn)", label: "reduce_priority" },
+    paper_only:      { color: "var(--ink-3)", label: "paper_only" },
+    remove:          { color: "var(--bad)",  label: "remove" },
+  };
+  const c = map[classification] || { color: "var(--ink-4)", label: classification || "—" };
+  return (
+    <span style={{
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "var(--s-2)",
+      fontFamily: "var(--mono)",
+      fontSize: 11,
+      color: c.color,
+    }}>
+      <span style={{
+        display: "inline-block",
+        width: 6, height: 6, borderRadius: "50%",
+        background: c.color,
+      }} />
+      {c.label}
     </span>
   );
 }
