@@ -15,6 +15,7 @@ const TRADES_LIMIT           = 30;
 const SCORES_LIMIT           = 60;   // bot_research_scores — fetched, then dedup'd client-side
 const SIGNALS_LIMIT          = 40;
 const POSITIONS_LIMIT        = 80;   // open positions across all bots — generous
+const APPROVALS_LIMIT        = 40;   // pending bot_approvals rows
 
 // Modes that are NOT live → render with a less-loud accent.
 const MODE_LABEL = {
@@ -158,6 +159,7 @@ export default function LeagueDashboard() {
   const [scores, setScores]       = useState([]);
   const [signals, setSignals]     = useState([]);
   const [positions, setPositions] = useState([]);
+  const [approvals, setApprovals] = useState([]);
 
   const cfg = getLeagueSupabaseConfig();
   const configured = !!(cfg.url && cfg.key);
@@ -170,7 +172,7 @@ export default function LeagueDashboard() {
     }
     const sb = createLeagueClient();
     try {
-      const [reg, st, rn, tr, sc, sg, ps] = await Promise.all([
+      const [reg, st, rn, tr, sc, sg, ps, ap] = await Promise.all([
         sb.from("bot_registry").select("*").order("bot_id", { ascending: true }),
         sb.from("bot_status").select("*"),
         sb.from("bot_runs").select("*").order("started_at", { ascending: false }).limit(RUNS_LIMIT),
@@ -178,6 +180,7 @@ export default function LeagueDashboard() {
         sb.from("bot_research_scores").select("*").order("scored_at", { ascending: false }).limit(SCORES_LIMIT),
         sb.from("bot_signals").select("*").order("generated_at", { ascending: false }).limit(SIGNALS_LIMIT),
         sb.from("bot_positions").select("*").eq("status", "open").order("entry_at", { ascending: false }).limit(POSITIONS_LIMIT),
+        sb.from("bot_approvals").select("*").eq("status", "pending").order("requested_at", { ascending: false }).limit(APPROVALS_LIMIT),
       ]);
       setRegistry(reg.data || []);
       setStatuses(st.data || []);
@@ -186,10 +189,11 @@ export default function LeagueDashboard() {
       setScores(sc.data || []);
       setSignals(sg.data || []);
       setPositions(ps.data || []);
+      setApprovals(ap.data || []);
       setFetchErr(
         reg.error?.message || st.error?.message || rn.error?.message ||
         tr.error?.message  || sc.error?.message || sg.error?.message ||
-        ps.error?.message  || null
+        ps.error?.message  || ap.error?.message || null
       );
     } catch (err) {
       setFetchErr(String(err?.message || err));
@@ -290,6 +294,15 @@ export default function LeagueDashboard() {
           </div>
         )}
       </section>
+
+      {/* ============================================================
+          PENDING APPROVALS — most actionable section, placed up top
+         ============================================================ */}
+      <ApprovalsSection
+        approvals={approvals}
+        regByBot={regByBot}
+        onResolved={fetchAll}
+      />
 
       {/* ============================================================
           BOTS — grouped by mode
@@ -587,6 +600,332 @@ function RunStatusBadge({ status }) {
       }} />
       {status || "—"}
     </span>
+  );
+}
+
+// ── Pending approvals ───────────────────────────────────────────────────────
+//
+// The only section on the page with write actions. Approve / Reject go
+// through /api/approvals/[id] (server-side), authenticated with a shared
+// operator token stored in sessionStorage. The token never reaches the
+// browser code paths that fetch Supabase — only the route handler reads
+// the service-role key.
+
+const TOKEN_STORAGE_KEY = "league_approval_token";
+
+function ApprovalsSection({ approvals, regByBot, onResolved }) {
+  const [token, setTokenState] = useState("");
+  const [tokenInput, setTokenInput] = useState("");
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState(null);
+
+  // Load token from sessionStorage on mount.
+  useEffect(() => {
+    try {
+      const t = sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
+      setTokenState(t);
+      setTokenInput(t);
+    } catch {
+      // sessionStorage unavailable — fine, user re-enters per page load
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const persistToken = (val) => {
+    setTokenState(val);
+    setTokenInput(val);
+    try {
+      if (val) sessionStorage.setItem(TOKEN_STORAGE_KEY, val);
+      else sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch {}
+  };
+
+  const decide = async (approvalId, status, note) => {
+    setError(null);
+    if (!token) {
+      setError("Set an operator token first.");
+      return;
+    }
+    setBusyId(approvalId);
+    try {
+      const resp = await fetch(`/api/approvals/${approvalId}`, {
+        method: "PATCH",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type":  "application/json",
+        },
+        body: JSON.stringify({ status, note: note || null }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.ok) {
+        setError(data.error || `HTTP ${resp.status}`);
+        return;
+      }
+      // Optimistic UX: clear local then re-fetch.
+      if (onResolved) onResolved();
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <section style={{ marginBottom: "var(--s-8)" }}>
+      <SectionHeader count={approvals.length}>Pending approvals</SectionHeader>
+
+      {/* Operator token row — always visible so it's obvious where to set it */}
+      <div style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "var(--s-3)",
+        paddingBottom: "var(--s-3)",
+        marginBottom: "var(--s-5)",
+        borderBottom: "1px solid var(--rule)",
+        fontSize: 12,
+      }}>
+        <span style={{
+          fontFamily: "var(--mono)",
+          fontSize: 11,
+          color: "var(--ink-4)",
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+        }}>
+          Operator token
+        </span>
+        <input
+          type="password"
+          value={tokenInput}
+          onChange={(e) => setTokenInput(e.target.value)}
+          placeholder={token ? "•••••• (set this session)" : "Paste LEAGUE_APPROVAL_TOKEN"}
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 12,
+            padding: "4px 6px",
+            border: "1px solid var(--rule)",
+            background: "var(--paper)",
+            color: "var(--ink)",
+            flex: "0 1 280px",
+            minWidth: 0,
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => persistToken(tokenInput.trim())}
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            padding: "4px 10px",
+            border: "1px solid var(--ink)",
+            background: "var(--ink)",
+            color: "var(--paper)",
+            cursor: "pointer",
+          }}
+        >
+          Save
+        </button>
+        {token && (
+          <button
+            type="button"
+            onClick={() => persistToken("")}
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 11,
+              padding: "4px 10px",
+              border: "1px solid var(--rule)",
+              background: "var(--paper)",
+              color: "var(--ink-3)",
+              cursor: "pointer",
+            }}
+          >
+            Clear
+          </button>
+        )}
+        <span style={{
+          marginLeft: "auto",
+          fontSize: 11,
+          color: "var(--ink-4)",
+          fontFamily: "var(--mono)",
+        }}>
+          {token ? "stored in sessionStorage" : "not set"}
+        </span>
+      </div>
+
+      {error && (
+        <div style={{
+          padding: "var(--s-3)",
+          marginBottom: "var(--s-4)",
+          border: "1px solid var(--bad)",
+          color: "var(--bad)",
+          fontFamily: "var(--mono)",
+          fontSize: 12,
+        }}>
+          {error}
+        </div>
+      )}
+
+      {approvals.length === 0 ? (
+        <EmptyHint>No pending approvals. Bots write here when they propose an action that requires human review.</EmptyHint>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: "var(--s-4)" }}>
+          {approvals.map(a => (
+            <ApprovalCard
+              key={a.id}
+              approval={a}
+              regByBot={regByBot}
+              onApprove={(note) => decide(a.id, "approved", note)}
+              onReject={(note)  => decide(a.id, "rejected", note)}
+              busy={busyId === a.id}
+              tokenSet={!!token}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ApprovalCard({ approval, regByBot, onApprove, onReject, busy, tokenSet }) {
+  const [note, setNote] = useState("");
+  const a = approval;
+  const reg = regByBot[a.bot_id];
+  const requestedMs = a.requested_at ? Date.now() - new Date(a.requested_at).getTime() : null;
+
+  return (
+    <div style={{
+      padding: "var(--s-5)",
+      border: "1px solid var(--ink-5)",
+      display: "grid",
+      gridTemplateColumns: "minmax(220px, 1fr) 2fr minmax(220px, auto)",
+      gap: "var(--s-5)",
+      alignItems: "start",
+    }}>
+      {/* LEFT: bot + action header */}
+      <div>
+        <div style={{ fontSize: 11, color: "var(--ink-4)", fontFamily: "var(--mono)",
+                      letterSpacing: "0.04em", textTransform: "uppercase",
+                      marginBottom: 2 }}>
+          {a.bot_id}
+        </div>
+        <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: "-0.01em" }}>
+          {reg?.bot_name || a.bot_id}
+        </div>
+        <div style={{ marginTop: "var(--s-2)", display: "flex", gap: "var(--s-3)",
+                      alignItems: "center" }}>
+          <span style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            padding: "2px 6px",
+            background: "var(--ink)",
+            color: "var(--paper)",
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}>
+            {a.action}
+          </span>
+          {a.symbol && (
+            <span style={{ fontFamily: "var(--mono)", fontSize: 13, fontWeight: 500 }}>
+              {a.symbol}
+            </span>
+          )}
+        </div>
+        <div style={{ marginTop: "var(--s-2)", fontSize: 11, color: "var(--ink-4)",
+                      fontFamily: "var(--mono)" }}>
+          requested {requestedMs != null ? fmtAgo(requestedMs) : "—"}
+        </div>
+      </div>
+
+      {/* MIDDLE: payload preview */}
+      <div>
+        <div style={{ fontSize: 11, color: "var(--ink-4)", fontFamily: "var(--mono)",
+                      letterSpacing: "0.04em", textTransform: "uppercase",
+                      marginBottom: "var(--s-2)" }}>
+          Proposed payload
+        </div>
+        <pre style={{
+          fontFamily: "var(--mono)",
+          fontSize: 11,
+          padding: "var(--s-3)",
+          background: "var(--paper-dim)",
+          border: "1px solid var(--rule)",
+          margin: 0,
+          maxHeight: 180,
+          overflow: "auto",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          color: "var(--ink-2)",
+        }}>
+{JSON.stringify(a.payload ?? {}, null, 2)}
+        </pre>
+        {a.signal_id && (
+          <div style={{ marginTop: "var(--s-2)", fontSize: 11, color: "var(--ink-4)",
+                        fontFamily: "var(--mono)" }}>
+            signal: {a.signal_id}
+          </div>
+        )}
+      </div>
+
+      {/* RIGHT: decision controls */}
+      <div style={{ display: "flex", flexDirection: "column", gap: "var(--s-3)", minWidth: 220 }}>
+        <textarea
+          rows={3}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="Optional note (visible in audit log)"
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 12,
+            padding: "6px 8px",
+            border: "1px solid var(--rule)",
+            background: "var(--paper)",
+            color: "var(--ink)",
+            resize: "vertical",
+          }}
+        />
+        <div style={{ display: "flex", gap: "var(--s-2)" }}>
+          <button
+            type="button"
+            onClick={() => onApprove(note)}
+            disabled={busy || !tokenSet}
+            style={{
+              flex: 1,
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              padding: "8px 10px",
+              border: "1px solid var(--ok)",
+              background: busy ? "var(--paper-dim)" : "var(--ok)",
+              color: busy ? "var(--ink-3)" : "var(--paper)",
+              cursor: (busy || !tokenSet) ? "not-allowed" : "pointer",
+              letterSpacing: "0.04em",
+              textTransform: "uppercase",
+            }}
+            title={tokenSet ? "" : "Set operator token first"}
+          >
+            {busy ? "..." : "Approve"}
+          </button>
+          <button
+            type="button"
+            onClick={() => onReject(note)}
+            disabled={busy || !tokenSet}
+            style={{
+              flex: 1,
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              padding: "8px 10px",
+              border: "1px solid var(--bad)",
+              background: "var(--paper)",
+              color: busy ? "var(--ink-3)" : "var(--bad)",
+              cursor: (busy || !tokenSet) ? "not-allowed" : "pointer",
+              letterSpacing: "0.04em",
+              textTransform: "uppercase",
+            }}
+            title={tokenSet ? "" : "Set operator token first"}
+          >
+            Reject
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
