@@ -13,6 +13,7 @@ const HEARTBEAT_DOWN_MIN     = 120;  // no heartbeat in N min → down
 const RUNS_LIMIT             = 30;
 const TRADES_LIMIT           = 30;
 const SCORES_LIMIT           = 60;   // bot_research_scores — fetched, then dedup'd client-side
+const SIGNALS_LIMIT          = 40;
 
 // Modes that are NOT live → render with a less-loud accent.
 const MODE_LABEL = {
@@ -154,6 +155,7 @@ export default function LeagueDashboard() {
   const [runs, setRuns]           = useState([]);
   const [trades, setTrades]       = useState([]);
   const [scores, setScores]       = useState([]);
+  const [signals, setSignals]     = useState([]);
 
   const cfg = getLeagueSupabaseConfig();
   const configured = !!(cfg.url && cfg.key);
@@ -166,21 +168,23 @@ export default function LeagueDashboard() {
     }
     const sb = createLeagueClient();
     try {
-      const [reg, st, rn, tr, sc] = await Promise.all([
+      const [reg, st, rn, tr, sc, sg] = await Promise.all([
         sb.from("bot_registry").select("*").order("bot_id", { ascending: true }),
         sb.from("bot_status").select("*"),
         sb.from("bot_runs").select("*").order("started_at", { ascending: false }).limit(RUNS_LIMIT),
         sb.from("bot_trades").select("*").order("occurred_at", { ascending: false }).limit(TRADES_LIMIT),
         sb.from("bot_research_scores").select("*").order("scored_at", { ascending: false }).limit(SCORES_LIMIT),
+        sb.from("bot_signals").select("*").order("generated_at", { ascending: false }).limit(SIGNALS_LIMIT),
       ]);
       setRegistry(reg.data || []);
       setStatuses(st.data || []);
       setRuns(rn.data || []);
       setTrades(tr.data || []);
       setScores(sc.data || []);
+      setSignals(sg.data || []);
       setFetchErr(
         reg.error?.message || st.error?.message || rn.error?.message ||
-        tr.error?.message  || sc.error?.message || null
+        tr.error?.message  || sc.error?.message || sg.error?.message || null
       );
     } catch (err) {
       setFetchErr(String(err?.message || err));
@@ -370,6 +374,35 @@ export default function LeagueDashboard() {
       </section>
 
       {/* ============================================================
+          SIGNALS — recent bot_signals rows across every bot
+         ============================================================ */}
+      <section style={{ marginBottom: "var(--s-8)" }}>
+        <SectionHeader count={signals.length}>Signals</SectionHeader>
+        {signals.length === 0 ? (
+          <EmptyHint>No signals yet. Research / watchlist bots write here when they identify ideas.</EmptyHint>
+        ) : (
+          <Table
+            cols={["Bot", "Time", "Type", "Symbol", "Direction", "Confidence", "Rationale"]}
+            colAlign={["left","left","left","left","left","right","left"]}
+          >
+            {signals.map(s => (
+              <tr key={s.id}>
+                <Td>{displayName(regByBot[s.bot_id])}</Td>
+                <Td mono>{fmtDate(s.generated_at)}</Td>
+                <Td mono>{s.signal_type}</Td>
+                <Td mono>{s.symbol || "—"}</Td>
+                <Td><DirectionBadge direction={s.direction} /></Td>
+                <Td mono align="right">
+                  {s.confidence != null ? Number(s.confidence).toFixed(2) : "—"}
+                </Td>
+                <Td>{s.rationale || "—"}</Td>
+              </tr>
+            ))}
+          </Table>
+        )}
+      </section>
+
+      {/* ============================================================
           RECENT TRADES
          ============================================================ */}
       <section style={{ marginBottom: "var(--s-8)" }}>
@@ -510,6 +543,21 @@ function RunStatusBadge({ status }) {
         background: color,
       }} />
       {status || "—"}
+    </span>
+  );
+}
+
+function DirectionBadge({ direction }) {
+  const map = {
+    LONG:    { color: "var(--ok)",   label: "LONG" },
+    SHORT:   { color: "var(--bad)",  label: "SHORT" },
+    NEUTRAL: { color: "var(--ink-3)", label: "NEUTRAL" },
+    EXIT:    { color: "var(--warn)", label: "EXIT" },
+  };
+  const c = map[direction] || { color: "var(--ink-4)", label: direction || "—" };
+  return (
+    <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: c.color, fontWeight: 600 }}>
+      {c.label}
     </span>
   );
 }
