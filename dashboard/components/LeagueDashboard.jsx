@@ -14,6 +14,7 @@ const RUNS_LIMIT             = 30;
 const TRADES_LIMIT           = 30;
 const SCORES_LIMIT           = 60;   // bot_research_scores — fetched, then dedup'd client-side
 const SIGNALS_LIMIT          = 40;
+const POSITIONS_LIMIT        = 80;   // open positions across all bots — generous
 
 // Modes that are NOT live → render with a less-loud accent.
 const MODE_LABEL = {
@@ -156,6 +157,7 @@ export default function LeagueDashboard() {
   const [trades, setTrades]       = useState([]);
   const [scores, setScores]       = useState([]);
   const [signals, setSignals]     = useState([]);
+  const [positions, setPositions] = useState([]);
 
   const cfg = getLeagueSupabaseConfig();
   const configured = !!(cfg.url && cfg.key);
@@ -168,13 +170,14 @@ export default function LeagueDashboard() {
     }
     const sb = createLeagueClient();
     try {
-      const [reg, st, rn, tr, sc, sg] = await Promise.all([
+      const [reg, st, rn, tr, sc, sg, ps] = await Promise.all([
         sb.from("bot_registry").select("*").order("bot_id", { ascending: true }),
         sb.from("bot_status").select("*"),
         sb.from("bot_runs").select("*").order("started_at", { ascending: false }).limit(RUNS_LIMIT),
         sb.from("bot_trades").select("*").order("occurred_at", { ascending: false }).limit(TRADES_LIMIT),
         sb.from("bot_research_scores").select("*").order("scored_at", { ascending: false }).limit(SCORES_LIMIT),
         sb.from("bot_signals").select("*").order("generated_at", { ascending: false }).limit(SIGNALS_LIMIT),
+        sb.from("bot_positions").select("*").eq("status", "open").order("entry_at", { ascending: false }).limit(POSITIONS_LIMIT),
       ]);
       setRegistry(reg.data || []);
       setStatuses(st.data || []);
@@ -182,9 +185,11 @@ export default function LeagueDashboard() {
       setTrades(tr.data || []);
       setScores(sc.data || []);
       setSignals(sg.data || []);
+      setPositions(ps.data || []);
       setFetchErr(
         reg.error?.message || st.error?.message || rn.error?.message ||
-        tr.error?.message  || sc.error?.message || sg.error?.message || null
+        tr.error?.message  || sc.error?.message || sg.error?.message ||
+        ps.error?.message  || null
       );
     } catch (err) {
       setFetchErr(String(err?.message || err));
@@ -325,6 +330,44 @@ export default function LeagueDashboard() {
               </tr>
             ))}
           </Table>
+        )}
+      </section>
+
+      {/* ============================================================
+          OPEN POSITIONS + EXPOSURES DONUT
+         ============================================================ */}
+      <section style={{ marginBottom: "var(--s-8)" }}>
+        <SectionHeader count={positions.length}>Open positions</SectionHeader>
+        {positions.length === 0 ? (
+          <EmptyHint>No open positions across the league.</EmptyHint>
+        ) : (
+          <>
+            <ExposuresPanel positions={positions} />
+            <Table
+              cols={["Bot", "Symbol", "Class", "Direction", "Qty", "Entry", "Notional", "Opened", "Paper"]}
+              colAlign={["left","left","left","left","right","right","right","left","left"]}
+            >
+              {positions.map(p => {
+                const dir = (p.metadata && p.metadata.direction) || "long";
+                const dirLabel = dir.toUpperCase();
+                return (
+                  <tr key={p.id}>
+                    <Td>{displayName(regByBot[p.bot_id])}</Td>
+                    <Td mono>{p.symbol}</Td>
+                    <Td mono>{p.asset_class}</Td>
+                    <Td><DirectionBadge direction={dirLabel === "SHORT" ? "SHORT" : "LONG"} /></Td>
+                    <Td mono align="right">
+                      {p.quantity != null ? Number(p.quantity).toFixed(6).replace(/\.?0+$/, "") : "—"}
+                    </Td>
+                    <Td mono align="right">{fmtUsd(p.entry_price)}</Td>
+                    <Td mono align="right">{fmtUsd(p.amount_usd)}</Td>
+                    <Td mono>{fmtDate(p.entry_at)}</Td>
+                    <Td mono>{p.is_paper ? "paper" : "live"}</Td>
+                  </tr>
+                );
+              })}
+            </Table>
+          </>
         )}
       </section>
 
@@ -544,6 +587,165 @@ function RunStatusBadge({ status }) {
       }} />
       {status || "—"}
     </span>
+  );
+}
+
+// ── Exposures (donut + legend) ───────────────────────────────────────────────
+//
+// Pure inline SVG so we don't pull a charting library. Aggregates open
+// positions by asset_class, sums amount_usd, renders a single donut and a
+// legend. If a position lacks amount_usd, it's skipped (no zero-slice).
+
+const ASSET_CLASS_COLOR = {
+  equity:         "var(--ok)",
+  etf:            "var(--ink-2)",
+  crypto:         "var(--warn)",
+  bond:           "var(--ink-3)",
+  option:         "var(--bad)",
+  option_spread:  "var(--ink-4)",
+};
+
+function ExposuresPanel({ positions }) {
+  // Aggregate by asset_class
+  const byClass = new Map();
+  let total = 0;
+  for (const p of positions) {
+    const amt = Number(p.amount_usd || 0);
+    if (!Number.isFinite(amt) || amt <= 0) continue;
+    const cls = p.asset_class || "unknown";
+    byClass.set(cls, (byClass.get(cls) || 0) + amt);
+    total += amt;
+  }
+  // Stable ordering: largest slice first
+  const slices = [...byClass.entries()]
+    .map(([asset_class, amount]) => ({
+      asset_class,
+      amount,
+      fraction: total > 0 ? amount / total : 0,
+      color: ASSET_CLASS_COLOR[asset_class] || "var(--ink-4)",
+    }))
+    .sort((a, b) => b.amount - a.amount);
+
+  if (total <= 0) {
+    return (
+      <div style={{
+        fontSize: 12,
+        color: "var(--ink-4)",
+        marginBottom: "var(--s-5)",
+        fontFamily: "var(--mono)",
+      }}>
+        No notional in open positions yet.
+      </div>
+    );
+  }
+
+  // Donut math
+  const r = 38;
+  const C = 2 * Math.PI * r;
+
+  let acc = 0;
+  const segments = slices.map((s, i) => {
+    const dash = s.fraction * C;
+    const node = (
+      <circle
+        key={s.asset_class}
+        cx="50" cy="50" r={r}
+        fill="none"
+        stroke={s.color}
+        strokeWidth="14"
+        strokeDasharray={`${dash} ${C - dash}`}
+        strokeDashoffset={-acc}
+        transform="rotate(-90 50 50)"
+      />
+    );
+    acc += dash;
+    return node;
+  });
+
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: "120px 1fr",
+      gap: "var(--s-5)",
+      alignItems: "center",
+      paddingBottom: "var(--s-5)",
+      marginBottom: "var(--s-5)",
+      borderBottom: "1px solid var(--rule)",
+    }}>
+      <div style={{ position: "relative", width: 120, height: 120 }}>
+        <svg viewBox="0 0 100 100" width="120" height="120">
+          {/* Track ring (faint) */}
+          <circle cx="50" cy="50" r={r} fill="none"
+                  stroke="var(--rule)" strokeWidth="14" />
+          {segments}
+        </svg>
+        <div style={{
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: "var(--mono)",
+          color: "var(--ink-3)",
+        }}>
+          <div style={{ fontSize: 9, letterSpacing: "0.04em", textTransform: "uppercase", color: "var(--ink-4)" }}>
+            Notional
+          </div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "var(--ink)" }} className="tabular">
+            ${total.toFixed(0)}
+          </div>
+        </div>
+      </div>
+
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+        gap: "var(--s-3) var(--s-5)",
+      }}>
+        {slices.map(s => (
+          <div key={s.asset_class} style={{
+            display: "flex",
+            alignItems: "baseline",
+            gap: "var(--s-2)",
+            fontSize: 12,
+          }}>
+            <span style={{
+              display: "inline-block",
+              width: 8, height: 8,
+              background: s.color,
+              flexShrink: 0,
+            }} />
+            <span style={{
+              fontFamily: "var(--mono)",
+              fontSize: 11,
+              letterSpacing: "0.02em",
+              textTransform: "uppercase",
+              color: "var(--ink-3)",
+            }}>
+              {s.asset_class}
+            </span>
+            <span style={{
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              color: "var(--ink)",
+              marginLeft: "auto",
+            }} className="tabular">
+              ${s.amount.toFixed(0)}
+            </span>
+            <span style={{
+              fontFamily: "var(--mono)",
+              fontSize: 10,
+              color: "var(--ink-4)",
+              minWidth: 36,
+              textAlign: "right",
+            }} className="tabular">
+              {(s.fraction * 100).toFixed(0)}%
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
