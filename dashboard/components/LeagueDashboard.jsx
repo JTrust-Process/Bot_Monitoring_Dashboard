@@ -16,6 +16,7 @@ const SCORES_LIMIT           = 60;   // bot_research_scores — fetched, then de
 const SIGNALS_LIMIT          = 40;
 const POSITIONS_LIMIT        = 80;   // open positions across all bots — generous
 const APPROVALS_LIMIT        = 40;   // pending bot_approvals rows
+const EXPENSES_LIMIT         = 200;  // bot_expenses rows — pull a year of monthly entries comfortably
 
 // Modes that are NOT live → render with a less-loud accent.
 const MODE_LABEL = {
@@ -160,6 +161,7 @@ export default function LeagueDashboard() {
   const [signals, setSignals]     = useState([]);
   const [positions, setPositions] = useState([]);
   const [approvals, setApprovals] = useState([]);
+  const [expenses, setExpenses]   = useState([]);
 
   const cfg = getLeagueSupabaseConfig();
   const configured = !!(cfg.url && cfg.key);
@@ -172,7 +174,7 @@ export default function LeagueDashboard() {
     }
     const sb = createLeagueClient();
     try {
-      const [reg, st, rn, tr, sc, sg, ps, ap] = await Promise.all([
+      const [reg, st, rn, tr, sc, sg, ps, ap, ex] = await Promise.all([
         sb.from("bot_registry").select("*").order("bot_id", { ascending: true }),
         sb.from("bot_status").select("*"),
         sb.from("bot_runs").select("*").order("started_at", { ascending: false }).limit(RUNS_LIMIT),
@@ -181,6 +183,7 @@ export default function LeagueDashboard() {
         sb.from("bot_signals").select("*").order("generated_at", { ascending: false }).limit(SIGNALS_LIMIT),
         sb.from("bot_positions").select("*").eq("status", "open").order("entry_at", { ascending: false }).limit(POSITIONS_LIMIT),
         sb.from("bot_approvals").select("*").eq("status", "pending").order("requested_at", { ascending: false }).limit(APPROVALS_LIMIT),
+        sb.from("bot_expenses").select("*").order("period", { ascending: false }).limit(EXPENSES_LIMIT),
       ]);
       setRegistry(reg.data || []);
       setStatuses(st.data || []);
@@ -190,10 +193,11 @@ export default function LeagueDashboard() {
       setSignals(sg.data || []);
       setPositions(ps.data || []);
       setApprovals(ap.data || []);
+      setExpenses(ex.data || []);
       setFetchErr(
         reg.error?.message || st.error?.message || rn.error?.message ||
         tr.error?.message  || sc.error?.message || sg.error?.message ||
-        ps.error?.message  || ap.error?.message || null
+        ps.error?.message  || ap.error?.message || ex.error?.message || null
       );
     } catch (err) {
       setFetchErr(String(err?.message || err));
@@ -317,6 +321,14 @@ export default function LeagueDashboard() {
           </section>
         )
       ))}
+
+      {/* ============================================================
+          EXPENSES — running cost picture vs. trade P&L
+         ============================================================ */}
+      <section style={{ marginBottom: "var(--s-8)" }}>
+        <SectionHeader count={expenses.length}>Net P&amp;L &amp; expenses</SectionHeader>
+        <ExpensesPanel expenses={expenses} trades={trades} />
+      </section>
 
       {/* ============================================================
           RECENT RUNS
@@ -1083,6 +1095,160 @@ function ExposuresPanel({ positions }) {
             </span>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ExpensesPanel — current-month cost picture + net P&L
+//
+//  Combines two sources:
+//    1. Manual entries in bot_expenses (subscriptions, hosting, API credits)
+//    2. Auto-derived trading fees from bot_trades.fees_usd (current month)
+//
+//  Shows:
+//    - Realized trade P&L this month (from bot_trades.pnl_usd)
+//    - Total expenses this month (manual + trading fees)
+//    - Net = P&L − expenses
+//    - Breakdown by category
+//
+//  Notes:
+//    - "This month" uses UTC for consistency with bot_trades.occurred_at and
+//      bot_expenses.period (YYYY-MM).
+//    - Annual entries (period = 'YYYY') are spread evenly across the year for
+//      the monthly view, so a $12/yr entry shows as $1 this month.
+//    - We only see TRADES_LIMIT recent trades, so the "trade P&L this month"
+//      is approximate if you have more than that many trades in-month. For
+//      our scale that's not yet a concern.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const EXPENSE_CATEGORY_LABEL = {
+  fly_hosting:             "Fly hosting",
+  anthropic_api:           "Anthropic API",
+  claude_subscription:     "Claude subscription",
+  perplexity_subscription: "Perplexity subscription",
+  openclaw_hosting:        "OpenClaw hosting",
+  public_subscription:     "Public subscription",
+  data_feed:               "Data feed",
+  trading_fees:            "Trading fees",  // virtual category derived from bot_trades
+  other:                   "Other",
+};
+
+function ExpensesPanel({ expenses, trades }) {
+  const now = new Date();
+  const yyyy = now.getUTCFullYear();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const currentMonth = `${yyyy}-${mm}`;
+  const currentYear  = String(yyyy);
+
+  // Manual expenses for the current month, annualized entries spread evenly.
+  const manualByCategory = new Map();
+  for (const e of expenses) {
+    const amt = Number(e.amount_usd || 0);
+    if (!Number.isFinite(amt) || amt <= 0) continue;
+    let monthShare = 0;
+    if (e.period === currentMonth) {
+      monthShare = amt;
+    } else if (e.period === currentYear) {
+      monthShare = amt / 12;
+    }
+    if (monthShare <= 0) continue;
+    const cat = e.category || "other";
+    manualByCategory.set(cat, (manualByCategory.get(cat) || 0) + monthShare);
+  }
+
+  // Trading fees + P&L from bot_trades occurring in current month (UTC).
+  let tradingFees = 0;
+  let realizedPnl = 0;
+  for (const t of trades) {
+    if (!t.occurred_at) continue;
+    const occurredMonth = t.occurred_at.slice(0, 7); // 'YYYY-MM'
+    if (occurredMonth !== currentMonth) continue;
+    const fee = Number(t.fees_usd || 0);
+    const pnl = Number(t.pnl_usd || 0);
+    if (Number.isFinite(fee)) tradingFees += fee;
+    if (Number.isFinite(pnl)) realizedPnl += pnl;
+  }
+  if (tradingFees > 0) {
+    manualByCategory.set("trading_fees", tradingFees);
+  }
+
+  const totalExpenses = [...manualByCategory.values()].reduce((s, x) => s + x, 0);
+  const net = realizedPnl - totalExpenses;
+
+  const rows = [...manualByCategory.entries()]
+    .map(([category, amount]) => ({ category, amount }))
+    .sort((a, b) => b.amount - a.amount);
+
+  if (rows.length === 0 && realizedPnl === 0) {
+    return (
+      <EmptyHint>
+        No expenses or realized P&amp;L recorded for {currentMonth} yet. Add rows
+        to bot_expenses or wait for the first closed trade.
+      </EmptyHint>
+    );
+  }
+
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr 1fr",
+      gap: "var(--s-5)",
+      alignItems: "stretch",
+      marginBottom: "var(--s-5)",
+    }}>
+      <Stat label={`Trade P&L (${currentMonth})`} value={fmtUsd(realizedPnl)}
+            alarm={realizedPnl < 0} />
+      <Stat label={`Expenses (${currentMonth})`} value={fmtUsd(totalExpenses)}
+            alarm={false} />
+      <Stat label="Net contribution" value={fmtUsd(net)}
+            alarm={net < 0} />
+
+      <div style={{
+        gridColumn: "1 / -1",
+        borderTop: "1px solid var(--rule)",
+        paddingTop: "var(--s-4)",
+      }}>
+        <div style={{
+          fontSize: 10, color: "var(--ink-4)", letterSpacing: "0.04em",
+          textTransform: "uppercase", marginBottom: "var(--s-3)",
+        }}>
+          Expense breakdown — {currentMonth}
+        </div>
+        {rows.length === 0 ? (
+          <div style={{ fontSize: 12, color: "var(--ink-4)", fontFamily: "var(--mono)" }}>
+            No expenses recorded for this month.
+          </div>
+        ) : (
+          <table style={{
+            width: "100%",
+            borderCollapse: "collapse",
+            fontFamily: "var(--mono)",
+            fontSize: 12,
+          }}>
+            <tbody>
+              {rows.map(r => (
+                <tr key={r.category}>
+                  <td style={{ padding: "4px 0", color: "var(--ink-2)" }}>
+                    {EXPENSE_CATEGORY_LABEL[r.category] || r.category}
+                  </td>
+                  <td style={{ padding: "4px 0", textAlign: "right", color: "var(--ink-3)" }}>
+                    {fmtUsd(r.amount)}
+                  </td>
+                </tr>
+              ))}
+              <tr style={{ borderTop: "1px solid var(--rule)" }}>
+                <td style={{ padding: "6px 0 0", color: "var(--ink)", fontWeight: 600 }}>
+                  Total
+                </td>
+                <td style={{ padding: "6px 0 0", textAlign: "right", color: "var(--ink)", fontWeight: 600 }}>
+                  {fmtUsd(totalExpenses)}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
