@@ -179,15 +179,28 @@ function deriveBotStatus(registryRow, statusRow, cadenceMin = null) {
   const ageMin = lastHb ? (Date.now() - lastHb) / 60000 : null;
 
   // Scale the staleness thresholds to how often this bot actually runs.
-  // A bot is only late once it has missed ~2.5 of its own cycles, and only
-  // stale once it has missed ~5. The flat constants act as floors so a
-  // very frequent bot (crypto, every 15 min) is not judged too harshly for
-  // a single skipped tick.
+  //
+  // ADDITIVE grace, not multiplicative (corrected 2026-07-25). The first
+  // version used cadence * 2.5 and * 5, which is sane at 15 minutes
+  // (37 / 75 min) and absurd at daily: a bot that died on Monday would read
+  // "Healthy" until Wednesday afternoon and not go red until Saturday. That
+  // over-corrected past the bug it was fixing — a broken bot looking healthy
+  // for 2.5 days is worse than a healthy bot looking broken.
+  //
+  // This also aligns with the other two surfaces in the repo
+  // (HealthDashboard.jsx and monitor/health_check.py), which both use
+  // 1x expected -> degraded, 2x expected -> down. Three surfaces now answer
+  // "how late is too late" the same way.
+  //
+  // Resulting behaviour: 15-min bot -> amber 35m, red 50m (close to the old
+  // flat 30/120, so no regression at the frequent end). Daily bot -> amber
+  // ~24h20m, red ~48h20m.
+  const GRACE_MIN = 20;
   const degradedMin = cadenceMin
-    ? Math.max(HEARTBEAT_DEGRADED_MIN, cadenceMin * 2.5)
+    ? cadenceMin + GRACE_MIN
     : HEARTBEAT_DEGRADED_MIN;
   const downMin = cadenceMin
-    ? Math.max(HEARTBEAT_DOWN_MIN, cadenceMin * 5)
+    ? cadenceMin * 2 + GRACE_MIN
     : HEARTBEAT_DOWN_MIN;
 
   const cadenceNote = cadenceMin
@@ -1041,12 +1054,27 @@ const ASSET_CLASS_COLOR = {
 };
 
 function ExposuresPanel({ positions }) {
-  // Aggregate by asset_class
+  // LIVE ONLY in the donut (fixed 2026-07-25). This used to sum every open
+  // position — paper and live together — into one "Notional $X" headline, so
+  // a figure like $8,400 could be $400 of real exposure and $8,000 of
+  // simulation. The per-row table showed is_paper; the aggregate erased it.
+  //
+  // Paper notional is still computed and shown as a separate subtotal, so
+  // nothing is hidden — it just isn't added to the number that reads as
+  // "money at risk".
   const byClass = new Map();
   let total = 0;
+  let paperTotal = 0;
+  let paperCount = 0;
+
   for (const p of positions) {
     const amt = Number(p.amount_usd || 0);
     if (!Number.isFinite(amt) || amt <= 0) continue;
+    if (p.is_paper) {
+      paperTotal += amt;
+      paperCount++;
+      continue;
+    }
     const cls = p.asset_class || "unknown";
     byClass.set(cls, (byClass.get(cls) || 0) + amt);
     total += amt;
@@ -1069,7 +1097,9 @@ function ExposuresPanel({ positions }) {
         marginBottom: "var(--s-5)",
         fontFamily: "var(--mono)",
       }}>
-        No notional in open positions yet.
+        {paperTotal > 0
+          ? `No live notional. ${fmtUsd(paperTotal)} in ${paperCount} paper position${paperCount === 1 ? "" : "s"}.`
+          : "No notional in open positions yet."}
       </div>
     );
   }
@@ -1243,29 +1273,68 @@ function ExpensesPanel({ expenses, trades }) {
   }
 
   // Trading fees + P&L from bot_trades occurring in current month (UTC).
-  let tradingFees = 0;
-  let realizedPnl = 0;
+  //
+  // LIVE AND PAPER ARE KEPT SEPARATE (fixed 2026-07-25). This loop used to
+  // sum every row into one "Trade P&L" figure and then compute
+  // `net = pnl - expenses`, which subtracted REAL dollars (Fly hosting,
+  // Anthropic API, Claude subscription) from SIMULATED gains. The resulting
+  // "Net contribution" was not a quantity that exists. Paper P&L is now
+  // reported alongside, never netted against real cash.
+  //
+  // Phantom rows are excluded entirely. Per the project convention,
+  // bot_trades rows with metadata.phantom = true are non-strategic
+  // artefacts — 28 such rows exist on etf_rotation_v1 from a state-reset
+  // bug — and counting them corrupts both P&L and fees.
+  const isPhantom = (t) =>
+    t?.metadata?.phantom === true || t?.metadata?.phantom === "true";
+
+  let tradingFees = 0;   // live only — this is real money out
+  let realizedPnl = 0;   // live only
+  let paperPnl    = 0;   // simulated, reported separately
+  let phantomSkipped = 0;
+
   for (const t of trades) {
     if (!t.occurred_at) continue;
-    const occurredMonth = t.occurred_at.slice(0, 7); // 'YYYY-MM'
+    // Parse rather than string-slice so a non-UTC timestamp can't misbucket
+    // trades at a month boundary.
+    const d = new Date(t.occurred_at);
+    if (Number.isNaN(d.getTime())) continue;
+    const occurredMonth =
+      `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
     if (occurredMonth !== currentMonth) continue;
+
+    if (isPhantom(t)) { phantomSkipped++; continue; }
+
     const fee = Number(t.fees_usd || 0);
     const pnl = Number(t.pnl_usd || 0);
+
+    if (t.is_paper) {
+      if (Number.isFinite(pnl)) paperPnl += pnl;
+      continue; // simulated fills incur no real fee
+    }
     if (Number.isFinite(fee)) tradingFees += fee;
     if (Number.isFinite(pnl)) realizedPnl += pnl;
   }
+
   if (tradingFees > 0) {
-    manualByCategory.set("trading_fees", tradingFees);
+    // ADD, don't overwrite — a bot_expenses row may already use this
+    // category this month, and `.set` silently discarded it.
+    manualByCategory.set(
+      "trading_fees",
+      (manualByCategory.get("trading_fees") || 0) + tradingFees
+    );
   }
 
   const totalExpenses = [...manualByCategory.values()].reduce((s, x) => s + x, 0);
+  // Net is deliberately live-only. Mixing paper gains in here is what made
+  // the old figure meaningless.
   const net = realizedPnl - totalExpenses;
 
   const rows = [...manualByCategory.entries()]
     .map(([category, amount]) => ({ category, amount }))
     .sort((a, b) => b.amount - a.amount);
 
-  if (rows.length === 0 && realizedPnl === 0) {
+  if (rows.length === 0 && realizedPnl === 0 && paperPnl === 0) {
     return (
       <EmptyHint>
         No expenses or realized P&amp;L recorded for {currentMonth} yet. Add rows
@@ -1277,17 +1346,31 @@ function ExpensesPanel({ expenses, trades }) {
   return (
     <div style={{
       display: "grid",
-      gridTemplateColumns: "1fr 1fr 1fr",
+      gridTemplateColumns: "repeat(4, 1fr)",
       gap: "var(--s-5)",
       alignItems: "stretch",
       marginBottom: "var(--s-5)",
     }}>
-      <Stat label={`Trade P&L (${currentMonth})`} value={fmtUsd(realizedPnl)}
+      <Stat label={`Live P&L (${currentMonth})`} value={fmtUsd(realizedPnl)}
             alarm={realizedPnl < 0} />
+      <Stat label={`Paper P&L (${currentMonth})`} value={fmtUsd(paperPnl)}
+            alarm={false} />
       <Stat label={`Expenses (${currentMonth})`} value={fmtUsd(totalExpenses)}
             alarm={false} />
-      <Stat label="Net contribution" value={fmtUsd(net)}
+      <Stat label="Net (live only)" value={fmtUsd(net)}
             alarm={net < 0} />
+
+      {phantomSkipped > 0 && (
+        <div style={{
+          gridColumn: "1 / -1",
+          fontSize: 11,
+          color: "var(--ink-3)",
+          marginTop: "calc(-1 * var(--s-3))",
+        }}>
+          {phantomSkipped} phantom trade{phantomSkipped === 1 ? "" : "s"} excluded
+          (metadata.phantom — non-strategic rows from a state-reset bug).
+        </div>
+      )}
 
       <div style={{
         gridColumn: "1 / -1",

@@ -25,7 +25,7 @@ const BOTS = [
     cadence: "every 15 minutes",
     marketHoursOnly: false,
     // Cron "7,22,37,52 * * * *" — genuinely 24/7, no active window.
-    activeUtcHours: null,
+    activeUtcWindowMin: null,
   },
   {
     id:   "stock",
@@ -40,23 +40,44 @@ const BOTS = [
     marketHoursOnly: true,
     // Cron "17 14-20 * * 1-5" — first fire 14:17 UTC, last 20:17 UTC.
     //
-    // This exists because marketHoursOnly ALONE produced a false "Down"
-    // every single trading morning. The NYSE opens 13:30 UTC (EDT) but this
-    // bot's first run is 14:17 UTC, so for ~47 minutes each day the market
-    // was open (suppression off) while the newest run was yesterday's 20:17
-    // — ~17 hours, far past expectedMinutes * 2 — and the card read "Down".
-    // Health has to be judged against the bot's OWN schedule, not the
-    // exchange's.
-    activeUtcHours: [14, 21],
+    // Expressed in MINUTES, not hours (corrected 2026-07-25). The first
+    // attempt used [14, 21] at hour granularity, so the window opened at
+    // 14:00 while the bot does not run until 14:17. The monitor polls at
+    // :08/:23/:38/:53, so the 14:08 check still saw yesterday's 20:17 run
+    // (~1071 min, vs expectedMinutes * 2 = 180) and reported "Down" —
+    // then "Recovered" at 14:23. That reduced the daily false alert from
+    // 47 minutes to 17 rather than removing it.
+    //
+    // marketHoursOnly alone cannot cover this: the NYSE opens 13:30 UTC in
+    // EDT, well before this bot's first run. Lateness has to be judged
+    // against the bot's OWN schedule.
+    activeUtcWindowMin: [14 * 60 + 17, 20 * 60 + 17],
   },
 ];
 
-/** True when `bot` is inside its scheduled operating window (UTC). */
+// Grace after the first scheduled run before we expect a row to exist.
+// Covers cron jitter plus the bot's own runtime.
+const FIRST_RUN_GRACE_MIN = 10;
+
+/** True when `bot` is inside its scheduled operating window (UTC).
+ *
+ *  Opens at first-run + grace (nothing can be late before the first run has
+ *  had a chance to land) and closes at last-run + expectedMinutes (after
+ *  which the bot is legitimately done for the day). */
 const inActiveWindow = (bot) => {
-  if (!bot.activeUtcHours) return true;       // 24/7 bot
-  const [startH, endH] = bot.activeUtcHours;
-  const h = new Date().getUTCHours();
-  return h >= startH && h < endH;
+  if (!bot.activeUtcWindowMin) return true;   // 24/7 bot
+  const [startMin, endMin] = bot.activeUtcWindowMin;
+  const now = new Date();
+  const nowMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return nowMin >= startMin + FIRST_RUN_GRACE_MIN
+      && nowMin <= endMin + bot.expectedMinutes;
+};
+
+/** Human-readable window, for the idle card's reason line. */
+const windowLabel = (bot) => {
+  const [s, e] = bot.activeUtcWindowMin;
+  const fmt = (m) => `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  return `${fmt(s + FIRST_RUN_GRACE_MIN)}–${fmt(e + bot.expectedMinutes)} UTC`;
 };
 
 // NYSE full-day closures. Must mirror monitor/health_check.py.
@@ -164,11 +185,10 @@ function deriveStatus(bot, runs, errors) {
   // the NYSE opens at 13:30 UTC while the stock bot's first run is 14:17,
   // and that 47-minute gap produced a false "Down" every trading morning.
   if (!inActiveWindow(bot)) {
-    const [startH, endH] = bot.activeUtcHours;
     return {
       status: "idle",
       label: "Idle",
-      reasons: [`Outside scheduled window (${startH}:00–${endH}:00 UTC).`],
+      reasons: [`Outside scheduled window (${windowLabel(bot)}).`],
       lastRun: runs[0] || null,
       msSinceRun: null,
       errors6h: 0,

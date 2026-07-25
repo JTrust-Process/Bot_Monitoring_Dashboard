@@ -40,6 +40,11 @@ from supabase import create_client
 STATE_FILE     = "status_state.json"
 COOLDOWN_HOURS = 6  # max alert frequency while bot stays in same bad state
 
+# Grace after a bot's first scheduled run of the day before we expect a row
+# to exist. Covers cron jitter plus the bot's own runtime. See
+# BotConfig.active_utc_window_min.
+FIRST_RUN_GRACE_MIN = 10
+
 # ── Error / stuck-run thresholds ─────────────────────────────────────────────
 # Tuned for current GitHub Actions cron reliability (15–60 min drift is normal).
 ERRORS_6H_DEGRADED  = 2
@@ -85,15 +90,23 @@ class BotConfig:
     supabase_key_env:      str    # env var holding the anon key
     expected_minutes:      int    # max minutes between runs before "degraded"
     market_hours_only:     bool   # if True, suppress alerts outside market hours
-    # Inclusive-start / exclusive-end UTC hour window for the bot's OWN cron.
-    # None means 24/7. Checked separately from market_hours_only because the
-    # two do not coincide: the NYSE opens 13:30 UTC while the stock bot's
-    # first run is 14:17 UTC, and that ~47-minute gap fired a false "down"
-    # Discord alert every single trading morning (market open -> suppression
-    # off, newest run ~17h old from yesterday's close, well past
-    # expected_minutes * 2). Judge lateness against the bot's schedule, not
-    # the exchange's.
-    active_utc_hours:      Optional[Tuple[int, int]] = None
+    # (first_run, last_run) as MINUTES past UTC midnight for the bot's own
+    # cron. None means 24/7.
+    #
+    # Checked separately from market_hours_only because the two do not
+    # coincide: the NYSE opens 13:30 UTC while the stock bot's first run is
+    # 14:17, and that gap fired a false "down" Discord alert every trading
+    # morning (market open -> suppression off, newest run ~17h old from
+    # yesterday's close, well past expected_minutes * 2).
+    #
+    # MINUTES, not hours (corrected 2026-07-25). An earlier fix used
+    # (14, 21) at hour granularity, so the window opened at 14:00 — before
+    # the 14:17 run. This monitor polls at :08/:23/:38/:53, so the 14:08
+    # check still alerted "down" and the 14:23 check then sent "Recovered".
+    # A red 🚨 followed 15 minutes later by a green ✅, every weekday, eight
+    # months a year. That is the alert-fatigue failure mode: the channel
+    # trains you to ignore it.
+    active_utc_window_min: Optional[Tuple[int, int]] = None
     # Schema differences between bots — column names + table names vary
     runs_table:            str = "bot_runs"
     errors_table:          str = "bot_errors"
@@ -131,7 +144,7 @@ BOTS = [
         supabase_key_env="CRYPTO_SUPABASE_ANON_KEY",
         expected_minutes=45,    # 15-min cadence + buffer
         market_hours_only=False,
-        active_utc_hours=None,  # cron "7,22,37,52 * * * *" — genuinely 24/7
+        active_utc_window_min=None,  # cron "7,22,37,52 * * * *" — genuinely 24/7
         # Crypto bot uses default schema: started_at / created_at
         bot_repo_owner="JTrust-Process",
         bot_repo_name="Crypto_Trading_Bot",
@@ -147,7 +160,8 @@ BOTS = [
         supabase_key_env="STOCK_SUPABASE_ANON_KEY",
         expected_minutes=90,    # hourly cadence + buffer
         market_hours_only=True,
-        active_utc_hours=(14, 21),  # cron "17 14-20 * * 1-5" — 14:17..20:17 UTC
+        # cron "17 14-20 * * 1-5" — first run 14:17 UTC, last 20:17 UTC.
+        active_utc_window_min=(14 * 60 + 17, 20 * 60 + 17),
         # Stock bot has different column names
         runs_started_col="start_time",
         errors_ts_col="timestamp",
@@ -231,14 +245,25 @@ def check_bot(cfg: BotConfig, now_utc: datetime) -> BotStatus:
     sb = create_client(url, key)
 
     # Outside the bot's own cron window there is nothing to be late for.
-    # Separate from the market-hours check below — see BotConfig.active_utc_hours
-    # for why conflating them produced a daily false alert.
-    if cfg.active_utc_hours is not None:
-        start_h, end_h = cfg.active_utc_hours
-        if not (start_h <= now_utc.hour < end_h):
+    # Separate from the market-hours check below — see
+    # BotConfig.active_utc_window_min for why conflating them produced a
+    # daily false alert.
+    #
+    # Window opens at first_run + grace (nothing can be late before the first
+    # run has had a chance to land) and closes at last_run + expected_minutes
+    # (after which the bot is legitimately finished for the day).
+    if cfg.active_utc_window_min is not None:
+        start_m, end_m = cfg.active_utc_window_min
+        now_m = now_utc.hour * 60 + now_utc.minute
+        open_m = start_m + FIRST_RUN_GRACE_MIN
+        close_m = end_m + cfg.expected_minutes
+        if not (open_m <= now_m <= close_m):
+            def _hhmm(m: int) -> str:
+                return f"{(m // 60) % 24:02d}:{m % 60:02d}"
             return BotStatus(
                 name=cfg.name, status="muted",
-                reasons=[f"outside scheduled window ({start_h}:00-{end_h}:00 UTC)"],
+                reasons=[f"outside scheduled window "
+                         f"({_hhmm(open_m)}-{_hhmm(close_m)} UTC)"],
                 last_run=None, minutes_since_run=None,
                 errors_6h=0, stuck_runs=0,
             )
