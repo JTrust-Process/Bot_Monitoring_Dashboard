@@ -32,6 +32,32 @@ function badRequest(message) {
   return NextResponse.json({ ok: false, error: message }, { status: 400 });
 }
 
+/**
+ * Constant-time string comparison.
+ *
+ * `a !== b` short-circuits on the first differing byte, so response time
+ * leaks how many leading characters were correct — enough to recover a
+ * token byte-by-byte given enough requests. This endpoint can approve
+ * real-money orders, so the comparison is worth doing properly even
+ * though the practical risk on a personal dashboard is low.
+ *
+ * Compares over a fixed number of iterations and accumulates differences
+ * with XOR rather than returning early. Lengths are folded into the
+ * result so a short guess cannot pass.
+ */
+function timingSafeEqual(a, b) {
+  const bufA = Buffer.from(String(a), "utf8");
+  const bufB = Buffer.from(String(b), "utf8");
+  // Compare over max length so the loop count does not reveal the
+  // expected length; the length check still fails the match.
+  const len = Math.max(bufA.length, bufB.length);
+  let diff = bufA.length ^ bufB.length;
+  for (let i = 0; i < len; i++) {
+    diff |= (bufA[i] ?? 0) ^ (bufB[i] ?? 0);
+  }
+  return diff === 0;
+}
+
 function checkAuth(req) {
   const expected = (process.env.LEAGUE_APPROVAL_TOKEN || "").trim();
   if (!expected) {
@@ -40,7 +66,9 @@ function checkAuth(req) {
   const header = req.headers.get("authorization") || "";
   const m = header.match(/^Bearer\s+(.+)$/i);
   if (!m) return { ok: false, why: "Missing Bearer token." };
-  if (m[1].trim() !== expected) return { ok: false, why: "Invalid token." };
+  if (!timingSafeEqual(m[1].trim(), expected)) {
+    return { ok: false, why: "Invalid token." };
+  }
   return { ok: true };
 }
 

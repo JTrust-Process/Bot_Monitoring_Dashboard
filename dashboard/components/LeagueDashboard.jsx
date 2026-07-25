@@ -58,6 +58,21 @@ const fmtAgo = (ms) => {
   return d === 1 ? "1 day ago" : `${d} days ago`;
 };
 
+// Like fmtAgo but for a bare interval — no "ago" suffix. Used to describe a
+// bot's observed run cadence, e.g. "runs about every 15 minutes".
+const fmtDuration = (minutes) => {
+  if (minutes == null) return "—";
+  const m = Math.round(minutes);
+  if (m < 1) return "under a minute";
+  if (m === 1) return "1 minute";
+  if (m < 60) return `${m} minutes`;
+  const h = Math.round(m / 60);
+  if (h === 1) return "1 hour";
+  if (h < 24) return `${h} hours`;
+  const d = Math.round(h / 24);
+  return d === 1 ? "1 day" : `${d} days`;
+};
+
 const fmtTime = (iso) => (iso ? new Date(iso).toISOString().slice(11, 19) : "--:--:--");
 const fmtDate = (iso) => {
   if (!iso) return "—";
@@ -108,7 +123,48 @@ const displayName = (registry) => registry?.bot_name || registry?.bot_id || "—
 //  Derived status per bot
 // ─────────────────────────────────────────────────────────────────────────────
 
-function deriveBotStatus(registryRow, statusRow) {
+/**
+ * Estimate a bot's normal run interval, in minutes, from its own history.
+ *
+ * WHY (fixed 2026-07-25): the staleness thresholds below used to be flat —
+ * 30 min to "Degraded", 120 min to "Stale" — applied to every bot no matter
+ * how often it actually runs. Daily bots were therefore permanently red:
+ * bond_research_v1 fires once at 14:35 UTC, so it showed Degraded from 15:05
+ * and Stale from 16:35, i.e. ~23 hours of every day, despite being perfectly
+ * healthy. That trained us to ignore the health colours entirely.
+ *
+ * Deriving cadence from bot_runs rather than hardcoding a per-bot table keeps
+ * the dashboard truthful when a schedule changes in agent_runner/scheduler.py
+ * without anyone remembering to update the UI.
+ *
+ * Uses the MEDIAN gap between consecutive runs, which shrugs off the one
+ * large gap you get across a weekend for weekday-only bots. Returns null when
+ * there's too little history to say, in which case the caller falls back to
+ * the flat defaults.
+ */
+function deriveCadenceMin(runsForBot) {
+  if (!Array.isArray(runsForBot) || runsForBot.length < 3) return null;
+
+  const times = runsForBot
+    .map(r => (r.started_at ? new Date(r.started_at).getTime() : null))
+    .filter(t => t != null)
+    .sort((a, b) => b - a); // newest first
+  if (times.length < 3) return null;
+
+  const gaps = [];
+  for (let i = 0; i < times.length - 1; i++) {
+    const gapMin = (times[i] - times[i + 1]) / 60000;
+    if (gapMin > 0) gaps.push(gapMin);
+  }
+  if (gaps.length < 2) return null;
+
+  gaps.sort((a, b) => a - b);
+  const mid = Math.floor(gaps.length / 2);
+  const median = gaps.length % 2 === 0 ? (gaps[mid - 1] + gaps[mid]) / 2 : gaps[mid];
+  return median > 0 ? median : null;
+}
+
+function deriveBotStatus(registryRow, statusRow, cadenceMin = null) {
   if (registryRow.status === "killed") {
     return { bucket: "bad", label: "Killed", reason: "Operator killed this bot." };
   }
@@ -122,6 +178,22 @@ function deriveBotStatus(registryRow, statusRow) {
   const lastHb = statusRow.last_heartbeat_at ? new Date(statusRow.last_heartbeat_at).getTime() : null;
   const ageMin = lastHb ? (Date.now() - lastHb) / 60000 : null;
 
+  // Scale the staleness thresholds to how often this bot actually runs.
+  // A bot is only late once it has missed ~2.5 of its own cycles, and only
+  // stale once it has missed ~5. The flat constants act as floors so a
+  // very frequent bot (crypto, every 15 min) is not judged too harshly for
+  // a single skipped tick.
+  const degradedMin = cadenceMin
+    ? Math.max(HEARTBEAT_DEGRADED_MIN, cadenceMin * 2.5)
+    : HEARTBEAT_DEGRADED_MIN;
+  const downMin = cadenceMin
+    ? Math.max(HEARTBEAT_DOWN_MIN, cadenceMin * 5)
+    : HEARTBEAT_DOWN_MIN;
+
+  const cadenceNote = cadenceMin
+    ? ` (runs about every ${fmtDuration(cadenceMin)})`
+    : "";
+
   // Bucket from explicit health if available, then layer the age threshold on top.
   let bucket = HEALTH_BUCKET[statusRow.health] || "idle";
   let label = statusRow.health ? statusRow.health[0].toUpperCase() + statusRow.health.slice(1) : "Unknown";
@@ -129,10 +201,10 @@ function deriveBotStatus(registryRow, statusRow) {
 
   if (ageMin == null) {
     bucket = "idle"; label = "No heartbeat"; reason = "Last heartbeat unknown.";
-  } else if (ageMin > HEARTBEAT_DOWN_MIN) {
-    bucket = "bad"; label = "Stale"; reason = `Last heartbeat ${Math.floor(ageMin)} minutes ago.`;
-  } else if (ageMin > HEARTBEAT_DEGRADED_MIN) {
-    if (bucket !== "bad") { bucket = "warn"; label = "Degraded"; reason = `Last heartbeat ${Math.floor(ageMin)} minutes ago.`; }
+  } else if (ageMin > downMin) {
+    bucket = "bad"; label = "Stale"; reason = `Last heartbeat ${Math.floor(ageMin)} minutes ago${cadenceNote}.`;
+  } else if (ageMin > degradedMin) {
+    if (bucket !== "bad") { bucket = "warn"; label = "Degraded"; reason = `Last heartbeat ${Math.floor(ageMin)} minutes ago${cadenceNote}.`; }
   } else if (statusRow.last_run_status === "failed" || statusRow.last_run_status === "timeout") {
     bucket = "bad"; label = "Last run failed"; reason = statusRow.last_error_msg || "Most recent run ended in failure.";
   } else if (statusRow.last_run_status === "warning") {
@@ -226,11 +298,23 @@ export default function LeagueDashboard() {
   const statusByBot = Object.fromEntries(statuses.map(s => [s.bot_id, s]));
   const regByBot    = Object.fromEntries(registry.map(r => [r.bot_id, r]));
 
+  // Group runs by bot so each bot's staleness thresholds can be scaled to
+  // its own observed cadence rather than a one-size-fits-all 30/120 minutes.
+  const runsByBot = runs.reduce((acc, run) => {
+    if (!run?.bot_id) return acc;
+    (acc[run.bot_id] = acc[run.bot_id] || []).push(run);
+    return acc;
+  }, {});
+
   // Derived per-bot rows
   const bots = registry.map(r => ({
     registry: r,
     status:   statusByBot[r.bot_id] || null,
-    derived:  deriveBotStatus(r, statusByBot[r.bot_id]),
+    derived:  deriveBotStatus(
+      r,
+      statusByBot[r.bot_id],
+      deriveCadenceMin(runsByBot[r.bot_id]),
+    ),
   }));
 
   const overall = bots.length === 0 ? "idle"
