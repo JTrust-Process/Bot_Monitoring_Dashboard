@@ -28,7 +28,7 @@ import sys
 import time as time_module
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -56,8 +56,14 @@ NY               = ZoneInfo("America/New_York")
 MARKET_OPEN_NY   = time(9, 30)
 MARKET_CLOSE_NY  = time(16, 0)
 
-# 2026 NYSE full-day closures. Update yearly.
-# Source: NYSE official holiday schedule.
+# NYSE full-day closures. Source: NYSE official holiday schedule.
+#
+# MAINTENANCE: covers only the years enumerated below. Once the calendar
+# passes them the set silently stops matching, holidays get treated as
+# ordinary trading days, and this script sends a false "down" alert on
+# Christmas. `_warn_if_holidays_stale()` makes that visible instead of
+# letting it rot quietly. Keep in sync with
+# dashboard/components/HealthDashboard.jsx.
 NYSE_HOLIDAYS = {
     date(2026, 1, 1),    # New Year's Day
     date(2026, 1, 19),   # MLK Day
@@ -79,6 +85,15 @@ class BotConfig:
     supabase_key_env:      str    # env var holding the anon key
     expected_minutes:      int    # max minutes between runs before "degraded"
     market_hours_only:     bool   # if True, suppress alerts outside market hours
+    # Inclusive-start / exclusive-end UTC hour window for the bot's OWN cron.
+    # None means 24/7. Checked separately from market_hours_only because the
+    # two do not coincide: the NYSE opens 13:30 UTC while the stock bot's
+    # first run is 14:17 UTC, and that ~47-minute gap fired a false "down"
+    # Discord alert every single trading morning (market open -> suppression
+    # off, newest run ~17h old from yesterday's close, well past
+    # expected_minutes * 2). Judge lateness against the bot's schedule, not
+    # the exchange's.
+    active_utc_hours:      Optional[Tuple[int, int]] = None
     # Schema differences between bots — column names + table names vary
     runs_table:            str = "bot_runs"
     errors_table:          str = "bot_errors"
@@ -114,8 +129,9 @@ BOTS = [
         name="Crypto",
         supabase_url_env="CRYPTO_SUPABASE_URL",
         supabase_key_env="CRYPTO_SUPABASE_ANON_KEY",
-        expected_minutes=45,    # 15-min cadence + buffer for GHA drift
+        expected_minutes=45,    # 15-min cadence + buffer
         market_hours_only=False,
+        active_utc_hours=None,  # cron "7,22,37,52 * * * *" — genuinely 24/7
         # Crypto bot uses default schema: started_at / created_at
         bot_repo_owner="JTrust-Process",
         bot_repo_name="Crypto_Trading_Bot",
@@ -129,8 +145,9 @@ BOTS = [
         name="Stock",
         supabase_url_env="STOCK_SUPABASE_URL",
         supabase_key_env="STOCK_SUPABASE_ANON_KEY",
-        expected_minutes=90,    # hourly cadence + buffer for GHA drift
+        expected_minutes=90,    # hourly cadence + buffer
         market_hours_only=True,
+        active_utc_hours=(14, 21),  # cron "17 14-20 * * 1-5" — 14:17..20:17 UTC
         # Stock bot has different column names
         runs_started_col="start_time",
         errors_ts_col="timestamp",
@@ -164,6 +181,24 @@ def save_status_state(state: dict) -> None:
 
 # ── Market hours check ────────────────────────────────────────────────────────
 
+def _warn_if_holidays_stale(now_utc: datetime) -> None:
+    """Print a loud warning when NYSE_HOLIDAYS no longer covers the current
+    year. Deliberately noisy: the failure mode is a false 'down' alert on a
+    market holiday, and there is no other signal that the table expired."""
+    covered = {d.year for d in NYSE_HOLIDAYS}
+    if not covered:
+        return
+    year = now_utc.astimezone(NY).year
+    if year not in covered:
+        print(
+            f"[health_check] WARNING: NYSE_HOLIDAYS covers "
+            f"{sorted(covered)} but it is now {year}. Market holidays will be "
+            f"treated as normal trading days and may trigger false 'down' "
+            f"alerts. Update this list AND "
+            f"dashboard/components/HealthDashboard.jsx."
+        )
+
+
 def in_market_hours(now_utc: datetime) -> bool:
     """
     NYSE regular session: Mon–Fri 9:30–16:00 America/New_York.
@@ -194,6 +229,19 @@ def check_bot(cfg: BotConfig, now_utc: datetime) -> BotStatus:
         )
 
     sb = create_client(url, key)
+
+    # Outside the bot's own cron window there is nothing to be late for.
+    # Separate from the market-hours check below — see BotConfig.active_utc_hours
+    # for why conflating them produced a daily false alert.
+    if cfg.active_utc_hours is not None:
+        start_h, end_h = cfg.active_utc_hours
+        if not (start_h <= now_utc.hour < end_h):
+            return BotStatus(
+                name=cfg.name, status="muted",
+                reasons=[f"outside scheduled window ({start_h}:00-{end_h}:00 UTC)"],
+                last_run=None, minutes_since_run=None,
+                errors_6h=0, stuck_runs=0,
+            )
 
     # If outside market hours and bot is market-hours-only, mute the check
     if cfg.market_hours_only and not in_market_hours(now_utc):
@@ -588,6 +636,7 @@ def send_recovery_notice(webhook: str, bot_name: str, action: str, detail: str) 
 
 def main() -> int:
     now_utc = datetime.now(timezone.utc)
+    _warn_if_holidays_stale(now_utc)
     webhook = os.getenv("HEALTH_WEBHOOK_URL", "")
     pat     = os.getenv("GH_PAT_BOT_RESTART", "")
 

@@ -21,9 +21,11 @@ const BOTS = [
     supabaseUrl: process.env.NEXT_PUBLIC_CRYPTO_SUPABASE_URL,
     supabaseKey: process.env.NEXT_PUBLIC_CRYPTO_SUPABASE_ANON_KEY,
     cols: { runStarted: "started_at", runEnded: "ended_at", errorTs: "created_at" },
-    expectedMinutes: 45,    // 15-min cadence + buffer for GHA drift
+    expectedMinutes: 45,    // 15-min cadence + buffer
     cadence: "every 15 minutes",
     marketHoursOnly: false,
+    // Cron "7,22,37,52 * * * *" — genuinely 24/7, no active window.
+    activeUtcHours: null,
   },
   {
     id:   "stock",
@@ -33,18 +35,67 @@ const BOTS = [
     supabaseUrl: process.env.NEXT_PUBLIC_STOCK_SUPABASE_URL,
     supabaseKey: process.env.NEXT_PUBLIC_STOCK_SUPABASE_ANON_KEY,
     cols: { runStarted: "start_time",  runEnded: "end_time",  errorTs: "timestamp" },
-    expectedMinutes: 90,    // hourly cadence + buffer for GHA drift
+    expectedMinutes: 90,    // hourly cadence + buffer
     cadence: "every hour, market hours",
     marketHoursOnly: true,
+    // Cron "17 14-20 * * 1-5" — first fire 14:17 UTC, last 20:17 UTC.
+    //
+    // This exists because marketHoursOnly ALONE produced a false "Down"
+    // every single trading morning. The NYSE opens 13:30 UTC (EDT) but this
+    // bot's first run is 14:17 UTC, so for ~47 minutes each day the market
+    // was open (suppression off) while the newest run was yesterday's 20:17
+    // — ~17 hours, far past expectedMinutes * 2 — and the card read "Down".
+    // Health has to be judged against the bot's OWN schedule, not the
+    // exchange's.
+    activeUtcHours: [14, 21],
   },
 ];
 
-// 2026 NYSE full-day closures. Update yearly. Must mirror monitor/health_check.py.
+/** True when `bot` is inside its scheduled operating window (UTC). */
+const inActiveWindow = (bot) => {
+  if (!bot.activeUtcHours) return true;       // 24/7 bot
+  const [startH, endH] = bot.activeUtcHours;
+  const h = new Date().getUTCHours();
+  return h >= startH && h < endH;
+};
+
+// NYSE full-day closures. Must mirror monitor/health_check.py.
+//
+// MAINTENANCE: this list only covers the years listed below. When the
+// calendar rolls past them the set silently stops matching, holidays are
+// treated as ordinary trading days, and the dashboard starts reporting
+// "Down" on Christmas. `holidayDataIsStale()` surfaces that instead of
+// letting it degrade quietly — see the console warning it emits.
 const NYSE_HOLIDAYS_ISO = new Set([
   "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
   "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
   "2026-11-26", "2026-12-25",
 ]);
+
+/** Years the holiday table actually covers, derived from the data itself
+ *  so it cannot drift out of sync with the entries above. */
+const HOLIDAY_YEARS = new Set(
+  [...NYSE_HOLIDAYS_ISO].map(d => d.slice(0, 4))
+);
+
+/** True when the current year has no holiday coverage. */
+const holidayDataIsStale = () => {
+  const nowYear = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", year: "numeric",
+  }).format(new Date());
+  return !HOLIDAY_YEARS.has(nowYear);
+};
+
+if (typeof window !== "undefined" && holidayDataIsStale()) {
+  // Deliberately loud. The failure mode is subtle (false "Down" on market
+  // holidays) and there is no other signal that the table expired.
+  console.warn(
+    "[HealthDashboard] NYSE_HOLIDAYS_ISO covers " +
+    `${[...HOLIDAY_YEARS].sort().join(", ")} but it is now a later year. ` +
+    "Market holidays will be treated as normal trading days and bots may " +
+    "show a false 'Down'. Update the list here AND in monitor/health_check.py."
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  UTILITIES
@@ -101,6 +152,23 @@ function deriveStatus(bot, runs, errors) {
       status: "idle",
       label: "Idle",
       reasons: ["Market closed."],
+      lastRun: runs[0] || null,
+      msSinceRun: null,
+      errors6h: 0,
+      stuckCount: 0,
+    };
+  }
+
+  // Outside the bot's own cron window there is nothing to be late for.
+  // Checked separately from market hours because the two do NOT coincide:
+  // the NYSE opens at 13:30 UTC while the stock bot's first run is 14:17,
+  // and that 47-minute gap produced a false "Down" every trading morning.
+  if (!inActiveWindow(bot)) {
+    const [startH, endH] = bot.activeUtcHours;
+    return {
+      status: "idle",
+      label: "Idle",
+      reasons: [`Outside scheduled window (${startH}:00–${endH}:00 UTC).`],
       lastRun: runs[0] || null,
       msSinceRun: null,
       errors6h: 0,
