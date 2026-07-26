@@ -913,16 +913,22 @@ function ApprovalsSection({ approvals, regByBot, onResolved, approvalsErr = null
         borderBottom: "1px solid var(--rule)",
         fontSize: 12,
       }}>
-        <span style={{
-          fontFamily: "var(--mono)",
-          fontSize: 11,
-          color: "var(--ink-4)",
-          letterSpacing: "0.04em",
-          textTransform: "uppercase",
-        }}>
+        {/* A real <label htmlFor>, not a <span> — screen readers previously
+            announced this as an unlabelled password field. */}
+        <label
+          htmlFor="operator-token"
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--ink-4)",
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+          }}
+        >
           Operator token
-        </span>
+        </label>
         <input
+          id="operator-token"
           type="password"
           value={tokenInput}
           onChange={(e) => setTokenInput(e.target.value)}
@@ -1838,7 +1844,7 @@ function Table({ cols, colAlign = [], children }) {
         <thead>
           <tr>
             {cols.map((c, i) => (
-              <th key={c} style={{
+              <th key={c} scope="col" style={{
                 textAlign: colAlign[i] || "left",
                 padding: "var(--s-2) var(--s-3)",
                 borderBottom: "1px solid var(--rule)",

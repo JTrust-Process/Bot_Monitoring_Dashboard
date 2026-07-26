@@ -2,8 +2,15 @@
 
 Monorepo containing two pieces:
 
-- **`monitor/`** — Python script + GHA workflow. Runs every 15 min, queries both bots' Supabase projects, pings Discord on issues.
-- **`dashboard/`** — Next.js 15 app deployed to Vercel. Brutalist mission-control UI showing live health status of both bots.
+- **`monitor/`** — Python script + GHA workflow. Runs every 15 min, queries the
+  Stock and Crypto Supabase projects, pings Discord on issues. Deliberately
+  hosted on GitHub Actions rather than Fly: if Fly goes down, the thing that
+  tells you Fly went down should not be on Fly.
+- **`dashboard/`** — Next.js 15 app on Vercel. Two pages:
+  - `/` — **Health**: Stock + Crypto, from their own Supabase projects.
+  - `/league` — **League**: the Trading Bot League control plane (registry,
+    approvals queue, positions, exposures, trades, expenses), from a third
+    Supabase project.
 
 ```
 bot-health-monitor/
@@ -11,15 +18,30 @@ bot-health-monitor/
 │   └── health_check.yaml     # GHA cron — runs monitor/health_check.py every 15 min
 ├── monitor/
 │   ├── health_check.py       # the Python check + Discord pinger
-│   ├── requirements.txt
-│   └── .env.example
+│   └── requirements.txt
 └── dashboard/                # Vercel-deployed Next.js app
     ├── app/
+    │   ├── page.jsx              # / — Health
+    │   ├── league/page.jsx       # /league — League
+    │   ├── layout.jsx
+    │   ├── globals.css
+    │   └── api/approvals/[id]/   # server-side approve/reject (service-role key)
     ├── components/
+    │   ├── HealthDashboard.jsx
+    │   ├── LeagueDashboard.jsx
+    │   └── HeaderClock.jsx
+    ├── lib/supabaseLeague.js
     ├── package.json
+    ├── .eslintrc.json
     ├── .env.local.example
     └── next.config.js
 ```
+
+> **Audit note.** `AUDIT_2026-07-25.md` in this directory records a full
+> read-only sweep of the repo, what was fixed, and what remains open. Worth
+> reading before making changes — several of the findings were cases of a
+> surface confidently reporting something untrue rather than anything
+> throwing an error.
 
 ---
 
@@ -98,12 +120,59 @@ Vercel does **not** take effect until you redeploy.
 
 ## What the dashboard shows
 
-- **Aggregate status banner** — one big word: ALL.SYSTEMS.GO / DEGRADED.PERFORMANCE / ALERT.STATE
-- **Per-bot panels** — status + key metrics (last run age, errors in last 6h, stuck runs)
-- **Run history** — last 12 runs per bot with status + age
-- **Aggregate error log** — last 15 errors across both bots, sorted newest first
+### `/` — Health (Stock + Crypto)
 
-Auto-refreshes every 60 seconds.
+- **Aggregate status sentence** — e.g. "All systems are operational."
+  Bots that are unconfigured are excluded from this verdict; "I can't see it"
+  is not the same as "it's broken."
+- **Per-bot panels** — status, last run age, errors in last 6h, stuck runs
+- **Run history** and an **aggregate error log**
+
+Health is judged against **each bot's own schedule**, not the clock:
+`expectedMinutes` per bot, plus an `activeUtcWindowMin` covering the bot's
+cron window, plus market-hours suppression for the stock bot. All three are
+needed — using market hours alone produced a false "Down" every trading
+morning, because the NYSE opens at 13:30 UTC while the stock bot's first run
+is 14:17.
+
+### `/league` — Trading Bot League
+
+- **Bot registry** grouped by mode (live / paper / research / other), with
+  staleness scaled to each bot's observed cadence
+- **Pending approvals** with Approve/Reject (server-side, see below)
+- **Open positions + exposures donut** — live only; paper and
+  unconfirmed positions are shown as separate subtotals rather than folded
+  into the headline
+- **Net P&L and expenses** — live and paper P&L kept separate, phantom
+  trades excluded
+- **Signals**, **research scores**, **recent runs**, **recent trades**
+
+Auto-refreshes every 60 seconds **while the tab is visible**, and refetches
+immediately on refocus.
+
+## Approvals endpoint
+
+`PATCH /api/approvals/<id>` runs server-side and holds the service-role key.
+Auth is a shared operator token in `LEAGUE_APPROVAL_TOKEN`, entered once per
+session in the UI and compared in constant time. Only `pending` rows can be
+decided, so a double-click cannot double-approve.
+
+## Alerting
+
+Discord alerts fire on state transitions with a 6-hour cooldown per bot.
+
+**Set `HEALTH_DEADMAN_URL`** to a check URL from healthchecks.io / Better
+Stack / Cronitor. Alerting is push-on-bad, so every failure mode of the
+monitor itself — a disabled GHA schedule, a missing webhook secret, an
+uncaught exception — presents as silence, which is indistinguishable from
+all-clear. The dead-man's switch inverts that: you get told when a ping
+*fails to arrive*.
+
+**Known gap:** the monitor covers Stock and Crypto only. The League bots
+(ETF rotation, short watchlist, bond research, agent research) have no
+Discord coverage — their health lives in `bot_status.last_heartbeat_at`
+rather than a `bot_runs` table, so `BotConfig` does not yet generalise to
+them.
 
 ## Adding a third bot
 

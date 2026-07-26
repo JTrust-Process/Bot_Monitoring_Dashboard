@@ -68,9 +68,12 @@ assertNoServiceRoleKeysArePublic();
 // real-money orders, so a CSP is doing real work here: it is the control that
 // limits an XSS from exfiltrating that token.
 //
-// NOTE: `script-src` is intentionally permissive for now because
-// app/layout.jsx renders an inline clock script via dangerouslySetInnerHTML.
-// Tighten to `'self'` once that is replaced with next/script or a useEffect.
+// `script-src` includes 'unsafe-inline' because Next.js injects inline
+// bootstrap/hydration scripts of its own. The app's OWN inline script (the
+// header clock) was removed on 2026-07-25 in favour of components/
+// HeaderClock.jsx, so the remaining allowance is framework-only. Moving to
+// a nonce-based policy would remove it entirely — worthwhile if this ever
+// becomes internet-facing rather than a personal dashboard.
 const securityHeaders = [
   { key: "X-Frame-Options",        value: "DENY" },
   { key: "X-Content-Type-Options", value: "nosniff" },

@@ -1,4 +1,6 @@
 import "./globals.css";
+import Link from "next/link";
+import HeaderClock from "../components/HeaderClock";
 
 export const metadata = {
   title: "Bot Health",
@@ -45,21 +47,17 @@ export default function RootLayout({ children }) {
             fontSize: 12,
             color: "var(--ink-3)",
           }}>
-            <a href="/" className="tnav">Health</a>
-            <a href="/league" className="tnav">League</a>
+            {/* next/link, not bare <a> — an anchor triggers a full document
+                load on every tab switch: React state discarded, both
+                dashboards remounted, every query refetched from scratch. */}
+            <Link href="/" className="tnav">Health</Link>
+            <Link href="/league" className="tnav">League</Link>
             {repoUrl && (
               <a href={repoUrl} target="_blank" rel="noopener noreferrer" className="tnav">
                 Source
               </a>
             )}
-            <span
-              id="hdr-clock"
-              suppressHydrationWarning
-              className="tabular"
-              style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--ink-4)" }}
-            >
-              --:--:--
-            </span>
+            <HeaderClock />
           </div>
         </header>
 
@@ -75,17 +73,9 @@ export default function RootLayout({ children }) {
           color: "var(--ink-4)",
           marginTop: "var(--s-9)",
         }}>
-          <span>Refresh every 60 seconds.</span>
-          <span className="tabular">Two channels.</span>
+          <span>Refresh every 60 seconds while this tab is visible.</span>
+          <span className="tabular">All times UTC.</span>
         </footer>
-
-        <script dangerouslySetInnerHTML={{ __html: `
-          (function tick() {
-            var el = document.getElementById('hdr-clock');
-            if (el) el.textContent = new Date().toISOString().slice(11,19);
-            setTimeout(tick, 1000);
-          })();
-        `}} />
       </body>
     </html>
   );
