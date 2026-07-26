@@ -47,6 +47,15 @@ jobs:
           STOCK_SUPABASE_URL:       ${{ secrets.STOCK_SUPABASE_URL }}
           STOCK_SUPABASE_ANON_KEY:  ${{ secrets.STOCK_SUPABASE_ANON_KEY }}
           HEALTH_WEBHOOK_URL:       ${{ secrets.HEALTH_WEBHOOK_URL }}
+          # Dead-man's switch. Optional — set this repo secret to a check URL
+          # from healthchecks.io / Better Stack / Cronitor and configure the
+          # expected period to match the cron above. Without it, a monitor
+          # that stops running is indistinguishable from all-clear, because
+          # every failure mode here presents as silence.
+          HEALTH_DEADMAN_URL:       ${{ secrets.HEALTH_DEADMAN_URL }}
+          # Only needed if a bot sets restart_enabled=True. Both are
+          # currently False, so this is unused credential surface — consider
+          # removing the secret until auto-restart is actually opted into.
           GH_PAT_BOT_RESTART:       ${{ secrets.GH_PAT_BOT_RESTART }}
         run: python health_check.py
 

@@ -213,6 +213,48 @@ def save_status_state(state: dict) -> None:
 
 # ── Market hours check ────────────────────────────────────────────────────────
 
+def ping_deadman() -> None:
+    """Signal 'the monitor itself completed a full pass'.
+
+    THE PROBLEM THIS SOLVES (H5, added 2026-07-25). Alerting here is
+    entirely push-on-bad: Discord receives a message only when something is
+    wrong. That means every failure mode of the MONITOR presents as silence,
+    and silence is indistinguishable from all-clear:
+
+      * GitHub disables `schedule:` triggers after 60 days of repository
+        inactivity — and a quiet period is exactly when you stop looking.
+      * A missing HEALTH_WEBHOOK_URL prints "no webhook configured" and
+        exits 0.
+      * An uncaught exception red-Xes a job in a tab you are not watching.
+
+    A dead-man's switch inverts the signal: an external service expects a
+    ping on a schedule and alerts you when one does NOT arrive. Configure
+    HEALTH_DEADMAN_URL with a check URL from healthchecks.io, Better Stack,
+    Cronitor, or similar (all have free tiers), set its expected period to
+    match this workflow's cron, and you will be told when the monitor stops
+    running rather than assuming it still is.
+
+    No-op when unset, so this is opt-in and cannot break the existing flow.
+    Deliberately called only at the END of main(), after every check has
+    completed — pinging earlier would report success for a run that later
+    crashed.
+    """
+    url = os.getenv("HEALTH_DEADMAN_URL", "").strip()
+    if not url:
+        print("[deadman] HEALTH_DEADMAN_URL not set — no liveness ping sent. "
+              "Without it, a monitor that stops running looks identical to "
+              "all-clear.")
+        return
+    try:
+        resp = requests.get(url, timeout=10)
+        if 200 <= resp.status_code < 300:
+            print("[deadman] liveness ping sent")
+        else:
+            print(f"[deadman] ping returned {resp.status_code}")
+    except Exception as e:  # noqa: BLE001 - never fail the run over this
+        print(f"[deadman] ping failed: {e}")
+
+
 def _warn_if_holidays_stale(now_utc: datetime) -> None:
     """Print a loud warning when NYSE_HOLIDAYS no longer covers the current
     year. Deliberately noisy: the failure mode is a false 'down' alert on a
@@ -827,6 +869,10 @@ def main() -> int:
                 new_state[s.name]["last_low_activity_alert"] = now_utc.isoformat()
 
     save_status_state(new_state)
+
+    # ─── 4. Dead-man's switch ────────────────────────────────────────────
+    # Ping AFTER all work completed successfully. See ping_deadman.
+    ping_deadman()
 
     # Exit non-zero if any bot is down — useful for visible GHA red-X status
     if any(s.status == "down" for s in statuses):

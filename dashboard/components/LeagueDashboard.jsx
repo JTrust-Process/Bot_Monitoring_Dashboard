@@ -1437,17 +1437,50 @@ function ExpensesPanel({ expenses, trades }) {
   const currentMonth = `${yyyy}-${mm}`;
   const currentYear  = String(yyyy);
 
-  // Manual expenses for the current month, annualized entries spread evenly.
+  // Manual expenses for the current month.
+  //
+  // RECURRING SUPPORT (M9, added 2026-07-25). Previously only two period
+  // formats contributed: an exact `YYYY-MM` match, or `YYYY` divided by 12.
+  // A monthly subscription entered once — say Claude Pro at period
+  // "2026-05" — therefore contributed ZERO in June onward. Expenses drifted
+  // downward every month unless someone remembered to add a row, and
+  // because `net = pnl - expenses`, "Net contribution" drifted *upward*.
+  // The dashboard got progressively more flattering with no signal it was
+  // doing so.
+  //
+  // A row now counts toward the current month when `recurring` is true and
+  // the month falls within [period, period_end ?? forever]. Those two
+  // columns do not exist on bot_expenses yet — see
+  // supabase/migrations/*_bot_expenses_recurring.sql in the League repo.
+  // Until they are added, `e.recurring` is undefined and behaviour is
+  // exactly as before, so this is safe to ship ahead of the migration.
   const manualByCategory = new Map();
+  let staleOneOffCount = 0;
+
   for (const e of expenses) {
     const amt = Number(e.amount_usd || 0);
     if (!Number.isFinite(amt) || amt <= 0) continue;
+
     let monthShare = 0;
+    const isMonthlyPeriod = /^\d{4}-\d{2}$/.test(e.period || "");
+
     if (e.period === currentMonth) {
       monthShare = amt;
     } else if (e.period === currentYear) {
-      monthShare = amt / 12;
+      monthShare = amt / 12;                        // annual, spread evenly
+    } else if (e.recurring && isMonthlyPeriod) {
+      // Recurs from `period` until `period_end` (inclusive) or indefinitely.
+      const startsBefore = e.period <= currentMonth;
+      const endsAfter    = !e.period_end || e.period_end >= currentMonth;
+      if (startsBefore && endsAfter) monthShare = amt;
+    } else if (isMonthlyPeriod && e.period < currentMonth && e.recurring === undefined) {
+      // A past monthly row on a schema without the `recurring` column. We
+      // cannot tell whether it was a one-off or an unmarked subscription,
+      // so we do NOT count it — but we surface that it exists rather than
+      // letting the total quietly under-report.
+      staleOneOffCount++;
     }
+
     if (monthShare <= 0) continue;
     const cat = e.category || "other";
     manualByCategory.set(cat, (manualByCategory.get(cat) || 0) + monthShare);
@@ -1550,6 +1583,22 @@ function ExpensesPanel({ expenses, trades }) {
         }}>
           {phantomSkipped} phantom trade{phantomSkipped === 1 ? "" : "s"} excluded
           (metadata.phantom — non-strategic rows from a state-reset bug).
+        </div>
+      )}
+
+      {staleOneOffCount > 0 && (
+        <div style={{
+          gridColumn: "1 / -1",
+          fontSize: 11,
+          color: "var(--warn)",
+          marginTop: "calc(-1 * var(--s-3))",
+          lineHeight: 1.6,
+        }}>
+          {staleOneOffCount} past expense row{staleOneOffCount === 1 ? "" : "s"} not
+          counted this month. `bot_expenses` has no `recurring` column, so a
+          subscription entered once cannot be distinguished from a one-off charge —
+          and expenses under-report until someone adds a new row each month. Run the
+          `bot_expenses_recurring` migration and mark the subscriptions.
         </div>
       )}
 
