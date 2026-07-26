@@ -549,7 +549,7 @@ export default function LeagueDashboard() {
         {sectionErrs.runs ? (
           <ErrorHint>Could not load runs: {sectionErrs.runs}</ErrorHint>
         ) : runs.length === 0 ? (
-          <EmptyHint>No runs recorded yet. They'll appear after the next bot cycle.</EmptyHint>
+          <EmptyHint>No runs recorded yet. They&apos;ll appear after the next bot cycle.</EmptyHint>
         ) : (
           <Table
             cols={["Bot", "Started", "Status", "Duration", "Trades", "Errors"]}
