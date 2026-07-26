@@ -751,6 +751,124 @@ def send_recovery_notice(webhook: str, bot_name: str, action: str, detail: str) 
     _post_with_retry(webhook, {"embeds": [embed]})
 
 
+# ── Trading Bot League bots ───────────────────────────────────────────────────
+#
+# The League bots (etf_rotation_v1, short_watchlist_v1, bond_research_v1,
+# agent_research_v1, ...) had NO Discord alerting at all until 2026-07-25.
+# The BOTS list above covers only Stock and Crypto, so five bots — including
+# etf_rotation_v1, which is in mode='live' and is the first paper-to-live
+# promotion target — could fail silently forever.
+#
+# They do not fit BotConfig: their health lives in the League's `bot_status`
+# table (one row per bot, `last_heartbeat_at`) rather than in a per-project
+# `bot_runs` table with bespoke column names. So rather than contort
+# BotConfig, this builds BotStatus objects directly and hands them to the
+# same alerting/dedup machinery.
+#
+# Cadence: read from bot_registry.expected_cadence_minutes when present
+# (add that column and this gets sharper automatically), else fall back to a
+# generous default so an infrequent research bot is not perpetually "down" —
+# the same trap the dashboard fell into with flat thresholds.
+
+LEAGUE_DEFAULT_CADENCE_MIN = 24 * 60   # assume daily unless told otherwise
+LEAGUE_GRACE_MIN           = 20        # matches the dashboard's additive grace
+
+
+def check_league_bots(now_utc: datetime) -> list[BotStatus]:
+    """Return a BotStatus for every enabled bot in the League registry.
+
+    Silent no-op when LEAGUE_SUPABASE_URL / LEAGUE_SUPABASE_ANON_KEY are
+    unset, so this is additive and cannot break the existing two-bot flow.
+    """
+    url = os.getenv("LEAGUE_SUPABASE_URL")
+    key = os.getenv("LEAGUE_SUPABASE_ANON_KEY")
+    if not url or not key:
+        print("[league] LEAGUE_SUPABASE_URL/ANON_KEY not set — League bots "
+              "are NOT being monitored")
+        return []
+
+    try:
+        sb = create_client(url, key)
+        reg = sb.table("bot_registry").select("*").execute()
+        sts = sb.table("bot_status").select("*").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[league] query failed: {e}")
+        return []
+
+    status_by_bot = {
+        r.get("bot_id"): r for r in (sts.data or []) if isinstance(r, dict)
+    }
+
+    out: list[BotStatus] = []
+    for r in (reg.data or []):
+        if not isinstance(r, dict):
+            continue
+        bot_id = r.get("bot_id")
+        if not bot_id:
+            continue
+
+        # Retired bots are not failures. Skip entirely rather than alerting
+        # forever on something deliberately switched off.
+        if r.get("status") in ("killed", "disabled"):
+            continue
+
+        name = f"League/{bot_id}"
+        st = status_by_bot.get(bot_id) or {}
+        reasons: list[str] = []
+
+        hb_raw = st.get("last_heartbeat_at")
+        hb_dt = None
+        minutes_since = None
+        if isinstance(hb_raw, str):
+            try:
+                hb_dt = datetime.fromisoformat(hb_raw.replace("Z", "+00:00"))
+                minutes_since = (now_utc - hb_dt).total_seconds() / 60.0
+            except Exception:  # noqa: BLE001
+                pass
+
+        cadence = r.get("expected_cadence_minutes") or LEAGUE_DEFAULT_CADENCE_MIN
+        try:
+            cadence = float(cadence)
+        except (TypeError, ValueError):
+            cadence = LEAGUE_DEFAULT_CADENCE_MIN
+
+        degraded_after = cadence + LEAGUE_GRACE_MIN
+        down_after     = cadence * 2 + LEAGUE_GRACE_MIN
+
+        if minutes_since is None:
+            status = "muted"
+            reasons.append("no heartbeat recorded yet")
+        elif minutes_since > down_after:
+            status = "down"
+            reasons.append(f"last heartbeat {minutes_since:.0f} min ago "
+                           f"(expected every ~{cadence:.0f})")
+        elif minutes_since > degraded_after:
+            status = "degraded"
+            reasons.append(f"last heartbeat {minutes_since:.0f} min ago "
+                           f"(expected every ~{cadence:.0f})")
+        else:
+            status = "healthy"
+
+        # A failed last run is worth flagging even when the heartbeat is fresh.
+        last_run_status = st.get("last_run_status")
+        if last_run_status in ("failed", "timeout"):
+            status = "down"
+            reasons.append(f"last run {last_run_status}"
+                           + (f": {st['last_error_msg']}" if st.get("last_error_msg") else ""))
+        elif last_run_status == "warning" and status == "healthy":
+            status = "degraded"
+            reasons.append("last run completed with warnings")
+
+        out.append(BotStatus(
+            name=name, status=status,
+            last_run=hb_dt, minutes_since_run=minutes_since,
+            errors_6h=0, stuck_runs=0,
+            reasons=reasons,
+        ))
+
+    return out
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -773,6 +891,17 @@ def main() -> int:
         if s.reasons:
             for r in s.reasons:
                 print(f"    └── {r}")
+
+    # League bots — same alerting path, no recovery actions (they have no
+    # workflow_dispatch target and are not in bot_cfgs, so
+    # should_attempt_restart is never reached for them).
+    for s in check_league_bots(now_utc):
+        statuses.append(s)
+        emoji = STATUS_EMOJI.get(s.status, "❓")
+        ms = f"{s.minutes_since_run:.0f}m" if s.minutes_since_run is not None else "—"
+        print(f"{emoji} {s.name}: {s.status} · last heartbeat {ms} ago")
+        for r in s.reasons:
+            print(f"    └── {r}")
 
     # Decide alerts and recoveries
     alerts:     list[BotStatus] = []
@@ -811,7 +940,12 @@ def main() -> int:
     # Both auto-restart and stuck-run cleanup are gated behind explicit
     # per-bot flags AND default to disabled. See audit notes.
     for s in statuses:
-        cfg  = bot_cfgs[s.name]
+        # League bots have no BotConfig — no workflow to dispatch, no
+        # per-project tables to clean up. They are alert-only, so skip the
+        # recovery block entirely rather than KeyError-ing the whole run.
+        cfg = bot_cfgs.get(s.name)
+        if cfg is None:
+            continue
         prev = new_state.get(s.name, {})
 
         # ─── 1. Mark stuck runs as abandoned (requires WRITE access) ──────

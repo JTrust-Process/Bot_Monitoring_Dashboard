@@ -42,6 +42,34 @@
   --s-9: 96px;
 }
 
+/* ── Dark mode ────────────────────────────────────────────────────────────
+   Added 2026-07-25. The palette was light-only, so on a dark-mode OS this
+   page was a white rectangle — which for something you check at odd hours
+   is a real irritation rather than a nicety.
+
+   Only the neutrals and status hues are re-pointed; every component reads
+   through these variables already, so nothing else needs to change.
+   Contrast was chosen to hold the same ~5:1 floor as the light theme —
+   see the --ink-4 note above. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:     #0c0c0d;
+    --paper-dim: #141416;
+    --ink:       #f5f5f5;
+    --ink-2:     #e5e5e5;
+    --ink-3:     #b4b4b4;  /* ~9:1  on --paper */
+    --ink-4:     #8a8a8a;  /* ~5.2:1 on --paper — matches the light AA floor */
+    --ink-5:     #3a3a3d;  /* hairlines / disabled only, never text */
+    --rule:      #26262a;
+
+    /* Brightened so they stay legible on a dark ground. */
+    --ok:        #34d399;
+    --warn:      #fbbf24;
+    --bad:       #f87171;
+    --idle:      #9ca3af;
+  }
+}
+
 html, body {
   background: var(--paper);
   color: var(--ink);

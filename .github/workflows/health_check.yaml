@@ -46,6 +46,13 @@ jobs:
           CRYPTO_SUPABASE_ANON_KEY: ${{ secrets.CRYPTO_SUPABASE_ANON_KEY }}
           STOCK_SUPABASE_URL:       ${{ secrets.STOCK_SUPABASE_URL }}
           STOCK_SUPABASE_ANON_KEY:  ${{ secrets.STOCK_SUPABASE_ANON_KEY }}
+          # Trading Bot League control plane. Without these the five League
+          # bots (etf_rotation_v1, short_watchlist_v1, bond_research_v1,
+          # agent_research_v1, ...) have NO alerting — etf_rotation_v1 is
+          # mode='live', so that gap covers real capital. Anon key only;
+          # this monitor never writes to the League.
+          LEAGUE_SUPABASE_URL:      ${{ secrets.LEAGUE_SUPABASE_URL }}
+          LEAGUE_SUPABASE_ANON_KEY: ${{ secrets.LEAGUE_SUPABASE_ANON_KEY }}
           HEALTH_WEBHOOK_URL:       ${{ secrets.HEALTH_WEBHOOK_URL }}
           # Dead-man's switch. Optional — set this repo secret to a check URL
           # from healthchecks.io / Better Stack / Cronitor and configure the
