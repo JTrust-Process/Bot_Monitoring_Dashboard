@@ -96,13 +96,16 @@ const fmtUsd = (n) => {
   return `${sign}$${abs.toFixed(2)}`;
 };
 
-const fmtPct = (n) => {
-  if (n == null) return "—";
-  const v = Number(n);
-  if (!Number.isFinite(v)) return "—";
-  const sign = v > 0 ? "+" : "";
-  return `${sign}${(v * (Math.abs(v) > 1 ? 1 : 100)).toFixed(2)}%`;
-};
+// REMOVED 2026-07-25: `fmtPct` was dead code (no callers) and its logic was
+// the guessing pattern this codebase keeps getting bitten by — it inferred
+// whether the input was a fraction or an already-scaled percentage from its
+// magnitude:
+//
+//     v * (Math.abs(v) > 1 ? 1 : 100)
+//
+// so a genuine 0.5% return supplied as `0.5` rendered as "50.00%". Deleted
+// rather than fixed: if a percent formatter is needed again, take the unit
+// as an explicit argument instead of divining it.
 
 const durMs = (run) => {
   if (run.duration_ms != null) return Number(run.duration_ms);
@@ -227,7 +230,26 @@ function deriveBotStatus(registryRow, statusRow, cadenceMin = null) {
   } else if (statusRow.last_run_status === "warning") {
     bucket = bucket === "bad" ? "bad" : "warn"; label = "Warning"; reason = "Most recent run completed with warnings.";
   } else if (statusRow.last_run_status === "success") {
-    bucket = "ok"; label = "Healthy"; reason = `Last run succeeded ${fmtAgo(Date.now() - lastHb)}.`;
+    // NOTE: this uses the HEARTBEAT timestamp to describe when the RUN
+    // finished, which is only exact if the bot heartbeats once per run.
+    // Worded as "Last heartbeat" to avoid overstating precision.
+    bucket = "ok"; label = "Healthy"; reason = `Last run succeeded · heartbeat ${fmtAgo(Date.now() - lastHb)}.`;
+  }
+
+  // Never return a bare em-dash next to a status dot (fixed 2026-07-25).
+  // Two paths could leave `reason` unset: health="down" combined with an age
+  // between the degraded and down thresholds (the `bucket !== "bad"` guard
+  // skips the assignment), and any last_run_status outside the four handled
+  // values — null, "partial", "skipped". Both rendered as "Down. —", which
+  // is the least useful possible thing to show for a bot that places orders.
+  if (reason === "—") {
+    const parts = [];
+    if (statusRow.health) parts.push(`health=${statusRow.health}`);
+    if (statusRow.last_run_status) parts.push(`last run=${statusRow.last_run_status}`);
+    if (ageMin != null) parts.push(`heartbeat ${Math.floor(ageMin)}m ago`);
+    reason = parts.length
+      ? `${parts.join(", ")}.`
+      : "No diagnostic detail reported by the bot.";
   }
 
   return { bucket, label, reason };
@@ -251,6 +273,11 @@ export default function LeagueDashboard() {
   const [positions, setPositions] = useState([]);
   const [approvals, setApprovals] = useState([]);
   const [expenses, setExpenses]   = useState([]);
+  // bot_id -> observed cadence in minutes (null when not determinable).
+  const [cadenceByBot, setCadenceByBot] = useState({});
+  // Per-section query errors, so each section can say "I failed" rather than
+  // "there is nothing here". See the setter in fetchAll.
+  const [sectionErrs, setSectionErrs]   = useState({});
 
   const cfg = getLeagueSupabaseConfig();
   const configured = !!(cfg.url && cfg.key);
@@ -283,11 +310,62 @@ export default function LeagueDashboard() {
       setPositions(ps.data || []);
       setApprovals(ap.data || []);
       setExpenses(ex.data || []);
+
+      // Per-section errors, not one collapsed string (fixed 2026-07-25).
+      // Every setter above uses `|| []`, so a failed query is
+      // indistinguishable from an empty table — and the sections then make
+      // positive claims: "No pending approvals.", "No open positions across
+      // the league." Only the FIRST error in the old `||` chain surfaced, so
+      // if two queries failed you were told about one and the other section
+      // simply lied. The approvals case is the sharp one: an order awaiting
+      // human review rendered as "nothing to do".
+      setSectionErrs({
+        registry:  reg.error?.message || null,
+        statuses:  st.error?.message  || null,
+        runs:      rn.error?.message  || null,
+        trades:    tr.error?.message  || null,
+        scores:    sc.error?.message  || null,
+        signals:   sg.error?.message  || null,
+        positions: ps.error?.message  || null,
+        approvals: ap.error?.message  || null,
+        expenses:  ex.error?.message  || null,
+      });
       setFetchErr(
         reg.error?.message || st.error?.message || rn.error?.message ||
         tr.error?.message  || sc.error?.message || sg.error?.message ||
         ps.error?.message  || ap.error?.message || ex.error?.message || null
       );
+
+      // ── Per-bot cadence (H2 fix, 2026-07-25) ───────────────────────────
+      // Cadence CANNOT be derived from the `runs` query above: that is a
+      // single global `.limit(30)` allocated by recency, so one 15-minute
+      // bot (96 rows/day) crowds out everything else and 30 rows spans only
+      // ~7.5 hours. A daily bot such as bond_research_v1 never accumulates
+      // the 3 rows deriveCadenceMin needs, so it returned null and the bot
+      // fell back to the flat 30/120 thresholds — i.e. the fix silently
+      // failed for exactly the bots it was written to rescue, and would have
+      // regressed further as run volume grew.
+      //
+      // Two sources, in priority order:
+      //   1. bot_registry.expected_cadence_minutes — registry truth. Does
+      //      not exist yet; add it to the League schema and this starts
+      //      being used automatically, no dashboard change required.
+      //   2. Observation — one small query per bot, so a daily bot's history
+      //      is never crowded out by a chatty one.
+      const regRows = reg.data || [];
+      const observed = await Promise.all(
+        regRows.map(async (r) => {
+          if (r.expected_cadence_minutes) return [r.bot_id, null]; // registry wins
+          const { data } = await sb
+            .from("bot_runs")
+            .select("started_at")
+            .eq("bot_id", r.bot_id)
+            .order("started_at", { ascending: false })
+            .limit(12);
+          return [r.bot_id, deriveCadenceMin(data || [])];
+        })
+      );
+      setCadenceByBot(Object.fromEntries(observed));
     } catch (err) {
       setFetchErr(String(err?.message || err));
     } finally {
@@ -316,22 +394,20 @@ export default function LeagueDashboard() {
   const regByBot    = Object.fromEntries(registry.map(r => [r.bot_id, r]));
 
   // Group runs by bot so each bot's staleness thresholds can be scaled to
-  // its own observed cadence rather than a one-size-fits-all 30/120 minutes.
-  const runsByBot = runs.reduce((acc, run) => {
-    if (!run?.bot_id) return acc;
-    (acc[run.bot_id] = acc[run.bot_id] || []).push(run);
-    return acc;
-  }, {});
+  // its own cadence rather than a one-size-fits-all 30/120 minutes.
+  //
+  // Cadence comes from `cadenceByBot` (registry column if present, else a
+  // per-bot query) — NOT from the global `runs` array, which cannot supply
+  // enough history for infrequent bots. See the fetchAll comment.
+  const cadenceFor = (r) =>
+    Number(r.expected_cadence_minutes) || cadenceByBot[r.bot_id] || null;
 
   // Derived per-bot rows
   const bots = registry.map(r => ({
     registry: r,
     status:   statusByBot[r.bot_id] || null,
-    derived:  deriveBotStatus(
-      r,
-      statusByBot[r.bot_id],
-      deriveCadenceMin(runsByBot[r.bot_id]),
-    ),
+    cadence:  cadenceFor(r),
+    derived:  deriveBotStatus(r, statusByBot[r.bot_id], cadenceFor(r)),
   }));
 
   // Deliberately retired bots must not pin the headline red forever

@@ -82,6 +82,20 @@ NYSE_HOLIDAYS = {
     date(2026, 12, 25),  # Christmas
 }
 
+# NYSE 1:00pm ET early closes. Same maintenance caveat as NYSE_HOLIDAYS —
+# _warn_if_holidays_stale() covers both since it derives its year set from
+# the union.
+#
+# Previously unmodelled: both surfaces treated the session as a fixed
+# 9:30-16:00 every trading day, so on these afternoons the bot's cron kept
+# firing through 20:17 UTC while the exchange was shut, and 13:00-16:00 ET
+# was still counted as a live session. Lower frequency than the morning gap,
+# but it lands on days you are least likely to be watching.
+NYSE_EARLY_CLOSE = {
+    date(2026, 11, 27): time(13, 0),  # day after Thanksgiving
+    date(2026, 12, 24): time(13, 0),  # Christmas Eve
+}
+
 
 @dataclass
 class BotConfig:
@@ -135,6 +149,10 @@ class BotStatus:
     errors_6h:             int
     stuck_runs:            int
     reasons:               list[str] = field(default_factory=list)
+    # True when the bot_runs query itself failed, as distinct from the bot
+    # having no history. Consumed by should_attempt_restart, which must
+    # refuse rather than guess when the monitor cannot see run history.
+    runs_query_failed:     bool = False
 
 
 BOTS = [
@@ -199,7 +217,7 @@ def _warn_if_holidays_stale(now_utc: datetime) -> None:
     """Print a loud warning when NYSE_HOLIDAYS no longer covers the current
     year. Deliberately noisy: the failure mode is a false 'down' alert on a
     market holiday, and there is no other signal that the table expired."""
-    covered = {d.year for d in NYSE_HOLIDAYS}
+    covered = {d.year for d in NYSE_HOLIDAYS} | {d.year for d in NYSE_EARLY_CLOSE}
     if not covered:
         return
     year = now_utc.astimezone(NY).year
@@ -215,17 +233,19 @@ def _warn_if_holidays_stale(now_utc: datetime) -> None:
 
 def in_market_hours(now_utc: datetime) -> bool:
     """
-    NYSE regular session: Mon–Fri 9:30–16:00 America/New_York.
-    Excludes weekends and the NYSE_HOLIDAYS set above.
+    NYSE regular session: Mon–Fri 9:30–16:00 America/New_York, honouring
+    1:00pm early closes. Excludes weekends and NYSE_HOLIDAYS.
     Uses zoneinfo so DST is handled automatically.
     """
     now_ny = now_utc.astimezone(NY)
     if now_ny.weekday() >= 5:  # 5=Sat, 6=Sun
         return False
-    if now_ny.date() in NYSE_HOLIDAYS:
+    today = now_ny.date()
+    if today in NYSE_HOLIDAYS:
         return False
+    close_t = NYSE_EARLY_CLOSE.get(today, MARKET_CLOSE_NY)
     t = now_ny.time()
-    return MARKET_OPEN_NY <= t <= MARKET_CLOSE_NY
+    return MARKET_OPEN_NY <= t <= close_t
 
 
 # ── Per-bot check ─────────────────────────────────────────────────────────────
@@ -359,6 +379,7 @@ def check_bot(cfg: BotConfig, now_utc: datetime) -> BotStatus:
         last_run=last_run_dt, minutes_since_run=minutes_since,
         errors_6h=errors_6h, stuck_runs=stuck_count,
         reasons=reasons,
+        runs_query_failed=runs_query_failed,
     )
 
 
@@ -561,14 +582,27 @@ def mark_stuck_runs_abandoned(cfg: BotConfig) -> tuple[int, str]:
 
 def check_low_activity(cfg: BotConfig, now_utc: datetime) -> Optional[int]:
     """
-    Returns days since last trade (None if trade table not configured or query fails).
-    Used for option-B alerts (long-running strategy producing no trades).
+    Returns days since last trade, or None when the check could not be made.
+
+    FAILURES ARE NOW LOGGED (2026-07-25). This used to end in a bare
+    `except Exception: return None` — the same value it returns for "no
+    trades table configured" — so callers could not tell the two apart. If
+    the query started failing (table renamed, RLS tightened, column
+    dropped) the low-activity alert would silently cease to exist, and you
+    would never learn a strategy had gone quiet because the check that
+    would have told you was itself quietly dead.
+
+    None still means "no answer"; the difference is that a genuine failure
+    now prints. Kept as None rather than a sentinel so the caller's
+    threshold comparison stays simple.
     """
     if not cfg.trades_table:
         return None
     url = os.getenv(cfg.supabase_url_env)
     key = os.getenv(cfg.supabase_key_env)
     if not url or not key:
+        print(f"[low-activity] {cfg.name}: skipped — {cfg.supabase_url_env}/"
+              f"{cfg.supabase_key_env} not set")
         return None
 
     sb = create_client(url, key)
@@ -583,7 +617,9 @@ def check_low_activity(cfg: BotConfig, now_utc: datetime) -> Optional[int]:
             return None
         last_trade = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return int((now_utc - last_trade).total_seconds() / 86400)
-    except Exception:
+    except Exception as e:
+        # Loud, because the failure mode is this check disappearing unnoticed.
+        print(f"[low-activity] {cfg.name}: query on {cfg.trades_table} failed: {e}")
         return None
 
 
@@ -599,8 +635,24 @@ def should_attempt_restart(prev: dict, current: BotStatus, now_utc: datetime, cf
     if current.status != "down":
         return False, f"status is {current.status}, not 'down'"
 
+    # REFUSE on incomplete information (hardened 2026-07-25).
+    #
+    # `minutes_since_run is None` conflates two very different situations:
+    # the bot genuinely has no run history, AND the bot_runs query threw
+    # (check_bot sets runs_query_failed but leaves minutes_since as None).
+    # The old guard below was skipped entirely in both cases, so a transient
+    # Supabase outage on the MONITOR's side could reach the restart path and
+    # bounce a live trading bot mid-incident.
+    #
+    # Latent today because both bots have restart_enabled=False, but this is
+    # the guess-on-failure pattern with real money on the other end.
+    if current.runs_query_failed:
+        return False, "run history unknown (query failed) — refusing to restart on incomplete data"
+    if current.minutes_since_run is None:
+        return False, "no run history at all — needs manual investigation, not a restart"
+
     # Don't restart if it's the "no trades for a week" reason — that's not a restart problem
-    if current.minutes_since_run is not None and current.minutes_since_run < cfg.expected_minutes * 2:
+    if current.minutes_since_run < cfg.expected_minutes * 2:
         return False, "down due to errors, not stale runs — restart won't help"
 
     # Panic mode check

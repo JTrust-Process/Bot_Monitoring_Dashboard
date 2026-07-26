@@ -109,11 +109,21 @@ const NYSE_HOLIDAYS_ISO = new Set([
   "2026-11-26", "2026-12-25",
 ]);
 
-/** Years the holiday table actually covers, derived from the data itself
+// NYSE 1:00pm ET early closes — value is minutes past midnight ET.
+// Mirrors NYSE_EARLY_CLOSE in monitor/health_check.py. Without these both
+// surfaces treated 13:00–16:00 ET on these days as a live session while the
+// exchange was shut.
+const NYSE_EARLY_CLOSE_ISO = {
+  "2026-11-27": 13 * 60,  // day after Thanksgiving
+  "2026-12-24": 13 * 60,  // Christmas Eve
+};
+
+/** Years the holiday tables actually cover, derived from the data itself
  *  so it cannot drift out of sync with the entries above. */
-const HOLIDAY_YEARS = new Set(
-  [...NYSE_HOLIDAYS_ISO].map(d => d.slice(0, 4))
-);
+const HOLIDAY_YEARS = new Set([
+  ...[...NYSE_HOLIDAYS_ISO].map(d => d.slice(0, 4)),
+  ...Object.keys(NYSE_EARLY_CLOSE_ISO).map(d => d.slice(0, 4)),
+]);
 
 /** True when the current year has no holiday coverage. */
 const holidayDataIsStale = () => {
@@ -178,7 +188,9 @@ const inMarketHours = () => {
   const hour = parts.hour === "24" ? 0 : parseInt(parts.hour, 10);
   const min  = parseInt(parts.minute, 10);
   const total = hour * 60 + min;
-  return total >= 9 * 60 + 30 && total <= 16 * 60;
+  // Honour 1pm early closes; default to the 16:00 regular close.
+  const closeMin = NYSE_EARLY_CLOSE_ISO[isoDate] ?? 16 * 60;
+  return total >= 9 * 60 + 30 && total <= closeMin;
 };
 
 function deriveStatus(bot, runs, errors, payload = {}) {
