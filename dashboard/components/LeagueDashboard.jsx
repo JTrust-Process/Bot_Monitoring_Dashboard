@@ -23,6 +23,10 @@ const MODE_LABEL = {
   live:     "Live",
   paper:    "Paper",
   research: "Research",
+  // Catch-all for registry rows whose `mode` is not one of the three above
+  // (typo, null, or a value introduced later). Without a bucket these rows
+  // rendered nowhere while still counting toward the headline.
+  other:    "Other / unclassified",
 };
 
 const STATUS_VAR = {
@@ -330,24 +334,47 @@ export default function LeagueDashboard() {
     ),
   }));
 
-  const overall = bots.length === 0 ? "idle"
-                : bots.some(b => b.derived.bucket === "bad")  ? "bad"
-                : bots.some(b => b.derived.bucket === "warn") ? "warn"
-                : bots.every(b => b.derived.bucket === "idle") ? "idle"
+  // Deliberately retired bots must not pin the headline red forever
+  // (fixed 2026-07-25). `status === "killed"` maps to bucket "bad", and
+  // `overall` went bad if ANY bot was bad — so one retired registry row
+  // held the page at "A bot in the league requires attention." permanently.
+  // That is the same permanent-false-alarm failure the cadence work was
+  // meant to eliminate. The row still renders red (a killed bot SHOULD be
+  // visibly killed); it just no longer votes on the aggregate.
+  const RETIRED = new Set(["killed", "disabled"]);
+  const active = bots.filter(b => !RETIRED.has(b.registry.status));
+  const retiredCount = bots.length - active.length;
+
+  const overall = active.length === 0 ? "idle"
+                : active.some(b => b.derived.bucket === "bad")  ? "bad"
+                : active.some(b => b.derived.bucket === "warn") ? "warn"
+                : active.every(b => b.derived.bucket === "idle") ? "idle"
                 : "ok";
 
+  const retiredSuffix = retiredCount > 0
+    ? ` (${retiredCount} retired, excluded)`
+    : "";
+
   const overallSentence = {
-    ok:   `${bots.length} bot${bots.length === 1 ? "" : "s"} registered, all healthy.`,
-    warn: `${bots.length} bot${bots.length === 1 ? "" : "s"} registered, some degraded.`,
+    ok:   `${active.length} active bot${active.length === 1 ? "" : "s"}, all healthy${retiredSuffix}.`,
+    warn: `${active.length} active bot${active.length === 1 ? "" : "s"}, some degraded${retiredSuffix}.`,
     bad:  "A bot in the league requires attention.",
-    idle: bots.length === 0 ? "No bots in registry yet." : "All bots idle.",
+    idle: active.length === 0
+      ? (bots.length === 0 ? "No bots in registry yet." : "All bots retired.")
+      : `All active bots idle${retiredSuffix}.`,
   }[overall];
 
-  // Buckets for the dashboard's "live / paper / research" grouping
+  // Buckets for the dashboard's "live / paper / research" grouping.
+  // `other` catches any mode outside the three known buckets — previously
+  // such a row rendered NOWHERE while still counting toward the headline,
+  // so the page could read "8 bots registered" above six visible rows, or
+  // turn red for a bot with no card to click.
+  const KNOWN_MODES = ["live", "paper", "research"];
   const byMode = {
     live:     bots.filter(b => b.registry.mode === "live"),
     paper:    bots.filter(b => b.registry.mode === "paper"),
     research: bots.filter(b => b.registry.mode === "research"),
+    other:    bots.filter(b => !KNOWN_MODES.includes(b.registry.mode)),
   };
 
   return (
@@ -408,7 +435,11 @@ export default function LeagueDashboard() {
       {/* ============================================================
           BOTS — grouped by mode
          ============================================================ */}
-      {["live", "paper", "research"].map(mode => (
+      {/* "other" is included so a registry row with an unexpected mode —
+          a typo, a null, or a value added later — still renders somewhere
+          instead of silently disappearing while counting toward the
+          headline. */}
+      {["live", "paper", "research", "other"].map(mode => (
         byMode[mode].length === 0 ? null : (
           <section key={mode} style={{ marginBottom: "var(--s-8)" }}>
             <SectionHeader count={byMode[mode].length}>{MODE_LABEL[mode]}</SectionHeader>
@@ -901,7 +932,7 @@ function ApprovalCard({ approval, regByBot, onApprove, onReject, busy, tokenSet 
   const requestedMs = a.requested_at ? Date.now() - new Date(a.requested_at).getTime() : null;
 
   return (
-    <div style={{
+    <div className="stack-sm" style={{
       padding: "var(--s-5)",
       border: "1px solid var(--ink-5)",
       display: "grid",
@@ -1344,7 +1375,7 @@ function ExpensesPanel({ expenses, trades }) {
   }
 
   return (
-    <div style={{
+    <div className="stack-sm" style={{
       display: "grid",
       gridTemplateColumns: "repeat(4, 1fr)",
       gap: "var(--s-5)",
@@ -1488,7 +1519,7 @@ function BotRow({ bot, index, total }) {
       gap: "var(--s-7)",
       padding: "var(--s-5) 0",
       borderBottom: isLast ? "none" : "1px solid var(--rule)",
-    }} className="fade-up">
+    }} className="fade-up stack-sm">
 
       {/* LEFT: name + mode + status dot */}
       <div>
@@ -1526,7 +1557,7 @@ function BotRow({ bot, index, total }) {
         <div style={{ fontSize: 14, color: "var(--ink-2)", lineHeight: 1.5, marginBottom: "var(--s-5)" }}>
           <strong style={{ fontWeight: 600 }}>{d.label}.</strong> {d.reason}
         </div>
-        <div style={{
+        <div className="stack-sm" style={{
           display: "grid",
           gridTemplateColumns: "repeat(4, 1fr)",
           gap: "var(--s-5)",

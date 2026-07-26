@@ -9,7 +9,14 @@
   --ink:          #0a0a0a;
   --ink-2:        #1a1a1a;
   --ink-3:        #525252;
-  --ink-4:        #a3a3a3;
+  /* Darkened from #a3a3a3 on 2026-07-25. The old value measured ~2.5:1
+     against --paper, well under the 4.5:1 WCAG AA minimum for normal text —
+     and it is used for essentially every label, timestamp, eyebrow and table
+     header in both dashboards, at 10-11px. The smallest type on the page had
+     the worst contrast. #6b6b6b measures ~5.3:1 and preserves the hierarchy,
+     since --ink-3 (~7.8:1) still reads as clearly darker. */
+  --ink-4:        #6b6b6b;
+  /* Hairlines and disabled states only — never text. */
   --ink-5:        #d4d4d4;
   --rule:         #e5e5e5;
 
@@ -67,6 +74,39 @@ button { font-family: var(--sans); cursor: pointer; background: none; border: no
 /* ── Utilities ────────────────────────────────────────────────────────── */
 
 .tabular { font-variant-numeric: tabular-nums; }
+
+/* ── Responsive ───────────────────────────────────────────────────────────
+   Added 2026-07-25. The repo previously contained ZERO media queries while
+   every layout was a fixed multi-column grid — "minmax(220px, 1.4fr) 2fr
+   auto", "repeat(4, 1fr)", "80px 100px 1fr 100px". On a phone the pages
+   overflowed horizontally and the stat rows compressed to unreadable
+   widths. For an operational dashboard whose entire value is checking on a
+   bot from wherever you happen to be, that is a functional gap rather than
+   a polish one.
+
+   Apply `.stack-sm` to any grid that should collapse to a single column,
+   and `.scroll-sm` to wrappers around wide tables that should scroll
+   horizontally rather than squash. Both are no-ops above the breakpoint. */
+
+@media (max-width: 760px) {
+  .stack-sm {
+    grid-template-columns: 1fr !important;
+    gap: var(--s-4) !important;
+  }
+
+  /* Wide data tables: let the table keep its width and scroll the
+     container, instead of crushing every column. */
+  .scroll-sm {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Pull in the generous desktop padding so content isn't a narrow ribbon. */
+  main {
+    padding-left: var(--s-4) !important;
+    padding-right: var(--s-4) !important;
+  }
+}
 
 /* Selection */
 ::selection { background: var(--ink); color: var(--paper); }

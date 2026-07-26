@@ -23,8 +23,21 @@ export function getLeagueSupabaseConfig() {
   };
 }
 
+// Memoised at module scope (2026-07-25). This used to return a NEW client on
+// every call, and LeagueDashboard calls it inside a 60-second poll. Each
+// createClient builds a fresh GoTrueClient which — autoRefreshToken defaults
+// to true — registers a ~30s setInterval and a `visibilitychange` listener
+// that is never torn down. A tab left open all day accumulated ~1,440
+// orphaned timers.
+//
+// The URL and key are NEXT_PUBLIC_* values, inlined at build time, so they
+// cannot change during the process lifetime. One client is correct.
+let _client = null;
+
 export function createLeagueClient() {
+  if (_client) return _client;
   const { url, key } = getLeagueSupabaseConfig();
   if (!url || !key) return null;
-  return createClient(url, key);
+  _client = createClient(url, key);
+  return _client;
 }

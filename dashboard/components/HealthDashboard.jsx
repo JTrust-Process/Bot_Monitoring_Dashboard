@@ -55,6 +55,22 @@ const BOTS = [
   },
 ];
 
+// Supabase clients, built ONCE at module scope.
+//
+// These used to be constructed inside the 60-second poll. Every
+// `createClient` spins up a fresh GoTrueClient which — with
+// autoRefreshToken defaulting to true — registers a ~30s setInterval and a
+// `visibilitychange` listener that nothing ever removes. Two bots x once a
+// minute meant a tab left open all day accumulated roughly 2,880 orphaned
+// timers and listeners.
+//
+// The URL and key are build-time-inlined constants that never change, so
+// the client is trivially hoistable.
+const CLIENTS = Object.fromEntries(
+  BOTS.filter(b => b.supabaseUrl && b.supabaseKey)
+      .map(b => [b.id, createClient(b.supabaseUrl, b.supabaseKey)])
+);
+
 // Grace after the first scheduled run before we expect a row to exist.
 // Covers cron jitter plus the bot's own runtime.
 const FIRST_RUN_GRACE_MIN = 10;
@@ -165,8 +181,29 @@ const inMarketHours = () => {
   return total >= 9 * 60 + 30 && total <= 16 * 60;
 };
 
-function deriveStatus(bot, runs, errors) {
+function deriveStatus(bot, runs, errors, payload = {}) {
   const reasons = [];
+
+  // "I cannot see this bot" is NOT "this bot is down" (fixed 2026-07-25).
+  // Missing env vars previously fell through to the `minSince == null`
+  // branch and rendered "Down — No runs on record", which also turned the
+  // page headline red. Because NEXT_PUBLIC_* values are inlined at BUILD
+  // time, a Vercel deploy that omitted one variable produced a dashboard
+  // confidently claiming your live trading bot was down.
+  if (payload.configured === false) {
+    return {
+      status: "idle",
+      label: "Not configured",
+      reasons: ["Supabase URL/key not set for this bot at build time. " +
+                "Add them in Vercel and redeploy — NEXT_PUBLIC_* values are " +
+                "baked in at build."],
+      lastRun: null,
+      msSinceRun: null,
+      errors6h: 0,
+      stuckCount: 0,
+      unknown: true,
+    };
+  }
 
   if (bot.marketHoursOnly && !inMarketHours()) {
     return {
@@ -236,6 +273,20 @@ function deriveStatus(bot, runs, errors) {
     reasons.push(`${stuck.length} cycle${stuck.length > 1 ? "s" : ""} running over ${STUCK_RUN_MINUTES} minutes.`);
   }
 
+  // FAIL CLOSED on telemetry failure, matching monitor/health_check.py's
+  // "if a sub-query failed silently, don't claim healthy" rule. A failed
+  // bot_errors query yields errors: [] -> errCount 0 -> the error
+  // thresholds above are skipped entirely, so without this the card reads
+  // "Healthy · All checks passing · Errors 6h: 0" when nothing was measured.
+  if ((payload.runsErr || payload.errorsErr) && status === "ok") {
+    status = "warn";
+    label  = "Degraded";
+    reasons.push("Telemetry query failed — health could not be confirmed.");
+  }
+  if (payload.errorsErr) {
+    reasons.push("Error count unavailable (query failed).");
+  }
+
   if (reasons.length === 0) reasons.push("All checks passing.");
 
   return {
@@ -267,19 +318,41 @@ export default function HealthDashboard() {
   const fetchAll = async () => {
     const result = {};
     for (const bot of BOTS) {
-      if (!bot.supabaseUrl || !bot.supabaseKey) {
-        result[bot.id] = { runs: [], errors: [], err: "Configuration missing." };
+      const sb = CLIENTS[bot.id];
+      if (!sb) {
+        // Distinct from an error: we cannot see this bot, which is NOT the
+        // same as the bot being down. See deriveStatus.
+        result[bot.id] = {
+          runs: [], errors: [], err: null,
+          configured: false, runsErr: null, errorsErr: null,
+        };
         continue;
       }
       try {
-        const sb = createClient(bot.supabaseUrl, bot.supabaseKey);
         const [r, e] = await Promise.all([
           sb.from("bot_runs").select("*").order(bot.cols.runStarted, { ascending: false }).limit(50),
           sb.from("bot_errors").select("*").order(bot.cols.errorTs, { ascending: false }).limit(20),
         ]);
-        result[bot.id] = { runs: r.data || [], errors: e.data || [], err: r.error?.message || e.error?.message || null };
+        // Track the two query failures SEPARATELY. Previously both collapsed
+        // into one `err` string and, more importantly, a failed bot_errors
+        // query produced `errors: []` which deriveStatus read as
+        // "zero errors" — rendering "Healthy · All checks passing" when the
+        // truth was "unknown". monitor/health_check.py has always failed
+        // closed here; the dashboard did not.
+        result[bot.id] = {
+          runs:   r.data || [],
+          errors: e.data || [],
+          runsErr:   r.error?.message || null,
+          errorsErr: e.error?.message || null,
+          err: r.error?.message || e.error?.message || null,
+          configured: true,
+        };
       } catch (err) {
-        result[bot.id] = { runs: [], errors: [], err: String(err.message || err) };
+        const msg = String(err.message || err);
+        result[bot.id] = {
+          runs: [], errors: [], err: msg,
+          runsErr: msg, errorsErr: msg, configured: true,
+        };
       }
     }
     setData(result);
@@ -289,8 +362,23 @@ export default function HealthDashboard() {
 
   useEffect(() => {
     fetchAll();
-    const id = setInterval(fetchAll, 60000);
-    return () => clearInterval(id);
+    // Poll only while the tab is visible. A backgrounded tab was issuing
+    // 1,440 Supabase round-trips a day per dashboard for data nobody was
+    // looking at. Refetch immediately on re-focus so the page is never
+    // stale when you actually return to it.
+    const id = setInterval(() => {
+      if (typeof document === "undefined" || document.visibilityState === "visible") {
+        fetchAll();
+      }
+    }, 60000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") fetchAll();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   if (loading) {
@@ -304,11 +392,20 @@ export default function HealthDashboard() {
   const statuses = BOTS.map(bot => ({
     bot,
     payload: data[bot.id] || { runs: [], errors: [] },
-    status:  deriveStatus(bot, data[bot.id]?.runs || [], data[bot.id]?.errors || []),
+    status:  deriveStatus(
+      bot,
+      data[bot.id]?.runs || [],
+      data[bot.id]?.errors || [],
+      data[bot.id] || {},
+    ),
   }));
 
-  const overall = statuses.some(s => s.status.status === "bad") ? "bad"
-                : statuses.some(s => s.status.status === "warn") ? "warn"
+  // Unconfigured bots are excluded from the headline — "I can't see it"
+  // should not colour the aggregate verdict for the bots we CAN see.
+  const visible = statuses.filter(s => !s.status.unknown);
+
+  const overall = visible.some(s => s.status.status === "bad") ? "bad"
+                : visible.some(s => s.status.status === "warn") ? "warn"
                 : statuses.every(s => s.status.status === "idle") ? "idle"
                 : "ok";
 
@@ -441,7 +538,7 @@ function BotRow({ bot, status, payload, isLast }) {
   const hasError = payload.err;
 
   return (
-    <div style={{
+    <div className="stack-sm" style={{
       display: "grid",
       gridTemplateColumns: "minmax(220px, 1.4fr) 2fr auto",
       gap: "var(--s-7)",
@@ -496,7 +593,7 @@ function BotRow({ bot, status, payload, isLast }) {
         </div>
 
         {/* Stats — typographic, no boxes */}
-        <div style={{
+        <div className="stack-sm" style={{
           display: "grid",
           gridTemplateColumns: "repeat(4, 1fr)",
           gap: "var(--s-5)",
