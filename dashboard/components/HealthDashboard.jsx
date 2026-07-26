@@ -276,13 +276,18 @@ function deriveStatus(bot, runs, errors, payload = {}) {
     reasons.push(`${errCount} error${errCount > 1 ? "s" : ""} in the last six hours.`);
   }
 
+  // Server-side count across the WHOLE table (see fetchAll). Falls back to
+  // scanning the fetched rows only if that query failed, which at least
+  // catches recent stuck runs rather than reporting none.
   const stuckThreshold = Date.now() - STUCK_RUN_MINUTES * 60 * 1000;
-  const stuck = runs.filter(r => r.status === "running" &&
-    new Date(r[bot.cols.runStarted]).getTime() < stuckThreshold);
+  const stuckCount = payload.stuckCount != null
+    ? payload.stuckCount
+    : runs.filter(r => r.status === "running" &&
+        new Date(r[bot.cols.runStarted]).getTime() < stuckThreshold).length;
 
-  if (stuck.length > 0) {
+  if (stuckCount > 0) {
     status = "bad"; label = "Down";
-    reasons.push(`${stuck.length} cycle${stuck.length > 1 ? "s" : ""} running over ${STUCK_RUN_MINUTES} minutes.`);
+    reasons.push(`${stuckCount} cycle${stuckCount > 1 ? "s" : ""} running over ${STUCK_RUN_MINUTES} minutes.`);
   }
 
   // FAIL CLOSED on telemetry failure, matching monitor/health_check.py's
@@ -290,13 +295,16 @@ function deriveStatus(bot, runs, errors, payload = {}) {
   // bot_errors query yields errors: [] -> errCount 0 -> the error
   // thresholds above are skipped entirely, so without this the card reads
   // "Healthy · All checks passing · Errors 6h: 0" when nothing was measured.
-  if ((payload.runsErr || payload.errorsErr) && status === "ok") {
+  if ((payload.runsErr || payload.errorsErr || payload.stuckErr) && status === "ok") {
     status = "warn";
     label  = "Degraded";
     reasons.push("Telemetry query failed — health could not be confirmed.");
   }
   if (payload.errorsErr) {
     reasons.push("Error count unavailable (query failed).");
+  }
+  if (payload.stuckErr) {
+    reasons.push("Stuck-run count unavailable (query failed).");
   }
 
   if (reasons.length === 0) reasons.push("All checks passing.");
@@ -307,7 +315,7 @@ function deriveStatus(bot, runs, errors, payload = {}) {
     lastRun,
     msSinceRun: msSince,
     errors6h: errCount,
-    stuckCount: stuck.length,
+    stuckCount,
   };
 }
 
@@ -341,9 +349,21 @@ export default function HealthDashboard() {
         continue;
       }
       try {
-        const [r, e] = await Promise.all([
+        // Stuck runs get their OWN server-side count (fixed 2026-07-25).
+        // Previously this was derived by filtering the 50 rows already
+        // fetched for display, while monitor/health_check.py counts across
+        // the whole table with count="exact". A run that hung four days ago
+        // and was never closed out sits below the 50-row horizon: Discord
+        // said Down, the dashboard said Healthy, and there was no way to
+        // reconcile them from the UI.
+        const stuckCutoff = new Date(Date.now() - STUCK_RUN_MINUTES * 60000).toISOString();
+        const [r, e, st] = await Promise.all([
           sb.from("bot_runs").select("*").order(bot.cols.runStarted, { ascending: false }).limit(50),
           sb.from("bot_errors").select("*").order(bot.cols.errorTs, { ascending: false }).limit(20),
+          sb.from("bot_runs")
+            .select("id", { count: "exact", head: true })
+            .eq("status", "running")
+            .lt(bot.cols.runStarted, stuckCutoff),
         ]);
         // Track the two query failures SEPARATELY. Previously both collapsed
         // into one `err` string and, more importantly, a failed bot_errors
@@ -356,7 +376,11 @@ export default function HealthDashboard() {
           errors: e.data || [],
           runsErr:   r.error?.message || null,
           errorsErr: e.error?.message || null,
-          err: r.error?.message || e.error?.message || null,
+          // null (not 0) when the count query failed — 0 would assert
+          // "no stuck runs" on no evidence.
+          stuckCount: st.error ? null : (st.count ?? 0),
+          stuckErr:   st.error?.message || null,
+          err: r.error?.message || e.error?.message || st.error?.message || null,
           configured: true,
         };
       } catch (err) {

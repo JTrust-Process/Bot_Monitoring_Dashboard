@@ -421,6 +421,10 @@ export default function LeagueDashboard() {
   const active = bots.filter(b => !RETIRED.has(b.registry.status));
   const retiredCount = bots.length - active.length;
 
+  // bot_id -> derived bot, for cross-referencing positions against the
+  // health of the bot that owns them (see positionIsConfirmed).
+  const botsById = Object.fromEntries(bots.map(b => [b.registry.bot_id, b]));
+
   const overall = active.length === 0 ? "idle"
                 : active.some(b => b.derived.bucket === "bad")  ? "bad"
                 : active.some(b => b.derived.bucket === "warn") ? "warn"
@@ -493,8 +497,10 @@ export default function LeagueDashboard() {
             fontSize: 12,
             color: "var(--ink-3)",
           }}>
-            Set NEXT_PUBLIC_LEAGUE_SUPABASE_URL and NEXT_PUBLIC_LEAGUE_SUPABASE_ANON_KEY in .env.local
-            (and Vercel project settings) to enable.
+            Set NEXT_PUBLIC_LEAGUE_SUPABASE_URL and NEXT_PUBLIC_LEAGUE_SUPABASE_ANON_KEY
+            in .env.local (and Vercel project settings), then <strong>redeploy</strong>.
+            NEXT_PUBLIC_* values are inlined at build time, so adding them in
+            Vercel and reloading this page will not take effect on its own.
           </div>
         )}
       </section>
@@ -506,6 +512,7 @@ export default function LeagueDashboard() {
         approvals={approvals}
         regByBot={regByBot}
         onResolved={fetchAll}
+        approvalsErr={sectionErrs.approvals}
       />
 
       {/* ============================================================
@@ -539,7 +546,9 @@ export default function LeagueDashboard() {
          ============================================================ */}
       <section style={{ marginBottom: "var(--s-8)" }}>
         <SectionHeader count={runs.length}>Recent runs</SectionHeader>
-        {runs.length === 0 ? (
+        {sectionErrs.runs ? (
+          <ErrorHint>Could not load runs: {sectionErrs.runs}</ErrorHint>
+        ) : runs.length === 0 ? (
           <EmptyHint>No runs recorded yet. They'll appear after the next bot cycle.</EmptyHint>
         ) : (
           <Table
@@ -567,11 +576,13 @@ export default function LeagueDashboard() {
          ============================================================ */}
       <section style={{ marginBottom: "var(--s-8)" }}>
         <SectionHeader count={positions.length}>Open positions</SectionHeader>
-        {positions.length === 0 ? (
+        {sectionErrs.positions ? (
+          <ErrorHint>Could not load positions: {sectionErrs.positions}</ErrorHint>
+        ) : positions.length === 0 ? (
           <EmptyHint>No open positions across the league.</EmptyHint>
         ) : (
           <>
-            <ExposuresPanel positions={positions} />
+            <ExposuresPanel positions={positions} botsById={botsById} />
             <Table
               cols={["Bot", "Symbol", "Class", "Direction", "Qty", "Entry", "Notional", "Opened", "Paper"]}
               colAlign={["left","left","left","left","right","right","right","left","left"]}
@@ -679,7 +690,9 @@ export default function LeagueDashboard() {
          ============================================================ */}
       <section style={{ marginBottom: "var(--s-8)" }}>
         <SectionHeader count={trades.length}>Recent trades</SectionHeader>
-        {trades.length === 0 ? (
+        {sectionErrs.trades ? (
+          <ErrorHint>Could not load trades: {sectionErrs.trades}</ErrorHint>
+        ) : trades.length === 0 ? (
           <EmptyHint>No trades mirrored into the League yet. (Stock + crypto only push here when they actually place an order.)</EmptyHint>
         ) : (
           <Table
@@ -829,7 +842,7 @@ function RunStatusBadge({ status }) {
 
 const TOKEN_STORAGE_KEY = "league_approval_token";
 
-function ApprovalsSection({ approvals, regByBot, onResolved }) {
+function ApprovalsSection({ approvals, regByBot, onResolved, approvalsErr = null }) {
   const [token, setTokenState] = useState("");
   const [tokenInput, setTokenInput] = useState("");
   const [busyId, setBusyId] = useState(null);
@@ -980,7 +993,12 @@ function ApprovalsSection({ approvals, regByBot, onResolved }) {
         </div>
       )}
 
-      {approvals.length === 0 ? (
+      {approvalsErr ? (
+        <ErrorHint>
+          Could not load approvals: {approvalsErr}. There may be pending
+          actions awaiting review that are not shown here.
+        </ErrorHint>
+      ) : approvals.length === 0 ? (
         <EmptyHint>No pending approvals. Bots write here when they propose an action that requires human review.</EmptyHint>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--s-4)" }}>
@@ -1160,7 +1178,26 @@ const ASSET_CLASS_COLOR = {
   option_spread:  "var(--ink-4)",
 };
 
-function ExposuresPanel({ positions }) {
+/** Is this position backed by a bot that is currently working?
+ *
+ *  Added 2026-07-25 (M8). `bot_positions` is queried with
+ *  `.eq("status","open")` and no bound on `entry_at`. If a bot dies
+ *  mid-position, or is killed without its rows being reconciled, the row
+ *  stays `open` forever and keeps contributing to the exposures headline —
+ *  presented as live risk you currently hold. Same shape as the dead crypto
+ *  symbol that rendered a full "live" panel for months: nothing checks.
+ *
+ *  A position is "unconfirmed" when its owning bot is retired, unhealthy,
+ *  or absent from the registry entirely. */
+function positionIsConfirmed(pos, botByIdMap) {
+  const bot = botByIdMap[pos.bot_id];
+  if (!bot) return false;                                   // orphaned row
+  if (["killed", "disabled"].includes(bot.registry.status)) return false;
+  if (["bad", "idle"].includes(bot.derived.bucket)) return false;
+  return true;
+}
+
+function ExposuresPanel({ positions, botsById = {} }) {
   // LIVE ONLY in the donut (fixed 2026-07-25). This used to sum every open
   // position — paper and live together — into one "Notional $X" headline, so
   // a figure like $8,400 could be $400 of real exposure and $8,000 of
@@ -1173,6 +1210,8 @@ function ExposuresPanel({ positions }) {
   let total = 0;
   let paperTotal = 0;
   let paperCount = 0;
+  let unconfirmedTotal = 0;
+  let unconfirmedCount = 0;
 
   for (const p of positions) {
     const amt = Number(p.amount_usd || 0);
@@ -1180,6 +1219,14 @@ function ExposuresPanel({ positions }) {
     if (p.is_paper) {
       paperTotal += amt;
       paperCount++;
+      continue;
+    }
+    // Positions whose bot is retired, unhealthy, or missing are counted
+    // separately — they may be stale rows rather than live exposure, and
+    // folding them into the headline overstates what you actually hold.
+    if (!positionIsConfirmed(p, botsById)) {
+      unconfirmedTotal += amt;
+      unconfirmedCount++;
       continue;
     }
     const cls = p.asset_class || "unknown";
@@ -1262,13 +1309,40 @@ function ExposuresPanel({ positions }) {
           color: "var(--ink-3)",
         }}>
           <div style={{ fontSize: 9, letterSpacing: "0.04em", textTransform: "uppercase", color: "var(--ink-4)" }}>
-            Notional
+            Live notional
           </div>
           <div style={{ fontSize: 14, fontWeight: 600, color: "var(--ink)" }} className="tabular">
             ${total.toFixed(0)}
           </div>
         </div>
       </div>
+
+      {/* Everything the donut deliberately excludes, stated rather than
+          silently dropped. */}
+      {(paperCount > 0 || unconfirmedCount > 0) && (
+        <div style={{
+          fontSize: 11,
+          color: "var(--ink-3)",
+          fontFamily: "var(--mono)",
+          marginBottom: "var(--s-4)",
+          lineHeight: 1.6,
+        }}>
+          {paperCount > 0 && (
+            <div>
+              Excluded: {fmtUsd(paperTotal)} across {paperCount} paper
+              position{paperCount === 1 ? "" : "s"} (simulated).
+            </div>
+          )}
+          {unconfirmedCount > 0 && (
+            <div style={{ color: "var(--warn)" }}>
+              Excluded: {fmtUsd(unconfirmedTotal)} across {unconfirmedCount}{" "}
+              unconfirmed position{unconfirmedCount === 1 ? "" : "s"} — owning bot
+              is retired, unhealthy, or missing from the registry. These rows may
+              be stale rather than live exposure; reconcile against the broker.
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{
         display: "grid",
@@ -1759,6 +1833,27 @@ function EmptyHint({ children }) {
       color: "var(--ink-4)",
       fontStyle: "italic",
       padding: "var(--s-5) 0",
+    }}>
+      {children}
+    </div>
+  );
+}
+
+/** Section-level failure state.
+ *
+ *  Distinct from EmptyHint on purpose (2026-07-25). Every fetch setter uses
+ *  `|| []`, so a failed query previously became an empty array and the
+ *  section asserted absence — "No pending approvals." — when the truth was
+ *  "I could not find out". For an approvals queue that is the difference
+ *  between "nothing needs you" and "an order is waiting and you cannot see
+ *  it". */
+function ErrorHint({ children }) {
+  return (
+    <div style={{
+      fontSize: 13,
+      color: "var(--bad)",
+      padding: "var(--s-5) 0",
+      fontFamily: "var(--mono)",
     }}>
       {children}
     </div>
