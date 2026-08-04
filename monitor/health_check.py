@@ -170,7 +170,14 @@ BOTS = [
         restart_enabled=False,        # OFF until explicitly approved
         cleanup_stuck_enabled=False,  # OFF until anon-key write story is verified
         trades_table="crypto_trades",
-        trades_ts_col="created_at",
+        # Corrected 2026-08-03. Was "created_at", which does not exist on this
+        # table — the column is `timestamp`. The query had been failing on
+        # every run since it was written, silently: check_low_activity caught
+        # the exception and returned None, the same value it returns for "no
+        # trades table configured", so the caller could not tell the
+        # difference. The low-activity alert simply did not exist. Surfaced
+        # only once that bare except started logging (audit M15).
+        trades_ts_col="timestamp",
     ),
     BotConfig(
         name="Stock",
@@ -189,7 +196,10 @@ BOTS = [
         restart_enabled=False,        # OFF until explicitly approved
         cleanup_stuck_enabled=False,  # OFF until anon-key write story is verified
         trades_table="trades",
-        trades_ts_col="timestamp",
+        # Corrected 2026-08-03 — same silent failure as the crypto bot above.
+        # The stock bot writes `timestamp_utc` (see log_trade in bot.py), not
+        # `timestamp`.
+        trades_ts_col="timestamp_utc",
     ),
 ]
 
@@ -773,6 +783,28 @@ def send_recovery_notice(webhook: str, bot_name: str, action: str, detail: str) 
 LEAGUE_DEFAULT_CADENCE_MIN = 24 * 60   # assume daily unless told otherwise
 LEAGUE_GRACE_MIN           = 20        # matches the dashboard's additive grace
 
+# League bot_ids ALREADY covered by an entry in BOTS above. Checking them
+# twice produced two contradictory verdicts for the same bot in one run:
+#
+#   ⚪ Stock: muted · outside scheduled window (14:27-21:47 UTC)
+#   🔴 League/stock_momentum_v1: down · last heartbeat 3134m ago
+#
+# The BotConfig path knows about market hours and cron windows; the League
+# path only compares heartbeat age. Defer to the richer check.
+LEAGUE_COVERED_ELSEWHERE = {
+    "stock_momentum_v1",
+    "crypto_ema_atr_v1",
+}
+
+# Every remaining League bot (etf_rotation_v1, short_watchlist_v1,
+# bond_research_v1, agent_research_v1) runs weekday market hours only. Their
+# heartbeats are therefore EXPECTED to be many hours stale overnight and all
+# weekend — 3,100+ minutes by Monday morning, which a flat cadence check
+# reads as "dead" when the bot is simply not scheduled.
+#
+# Mute them outside market hours, mirroring BotConfig.market_hours_only.
+LEAGUE_MARKET_HOURS_ONLY = True
+
 
 def check_league_bots(now_utc: datetime) -> list[BotStatus]:
     """Return a BotStatus for every enabled bot in the League registry.
@@ -810,6 +842,23 @@ def check_league_bots(now_utc: datetime) -> list[BotStatus]:
         # Retired bots are not failures. Skip entirely rather than alerting
         # forever on something deliberately switched off.
         if r.get("status") in ("killed", "disabled"):
+            continue
+
+        # Skip bots that have a full BotConfig entry — that path understands
+        # market hours and cron windows, this one does not. Two checks on one
+        # bot produced two contradictory verdicts in the same run.
+        if bot_id in LEAGUE_COVERED_ELSEWHERE:
+            continue
+
+        # Outside market hours these bots are not scheduled, so heartbeat age
+        # says nothing about health. Mute rather than alert.
+        if LEAGUE_MARKET_HOURS_ONLY and not in_market_hours(now_utc):
+            out.append(BotStatus(
+                name=f"League/{bot_id}", status="muted",
+                last_run=None, minutes_since_run=None,
+                errors_6h=0, stuck_runs=0,
+                reasons=["market closed — weekday bots not scheduled"],
+            ))
             continue
 
         name = f"League/{bot_id}"
